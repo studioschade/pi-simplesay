@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="360" viewBox="0 0 1200 360"
+     role="img" aria-labelledby="title desc">
+  <title id="title">SimpleSay</title>
+  <desc id="desc">A pi extension that speaks an agent's reply live while it is still streaming, instead of waiting for the full response to finish generating before speech starts.</desc>
+
+  <defs>
+    <linearGradient id="accentLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f2b84b"/>
+      <stop offset="100%" stop-color="#ef7f6a"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="360" rx="26" fill="#0b0d10"/>
+
+  <!-- title block -->
+  <g id="title-block" transform="translate(56 56)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" letter-spacing="2" fill="#f2b84b">PI EXTENSION · LIVE VOICE</text>
+
+    <text x="0" y="58" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="52" font-weight="700" fill="#f4f2ee">SimpleSay</text>
+
+    <rect x="2" y="76" width="64" height="4" rx="2" fill="url(#accentLine)"/>
+
+    <text x="0" y="122" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="21" font-weight="600" fill="#e0c9b8">Speaks while the model is still writing.</text>
+
+    <text x="0" y="156" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" fill="#9aa0a6">Most voice systems wait for the full reply to finish before</text>
+    <text x="0" y="180" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" fill="#9aa0a6">speaking a word. SimpleSay starts on the first sentence &#8212;</text>
+    <text x="0" y="204" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" fill="#9aa0a6">no separate read-back pass, no tokens spent deciding.</text>
+
+    <text x="0" y="250" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#6b7178">stream + tag modes</text>
+    <text x="215" y="250" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#6b7178">zero-token skip logic</text>
+    <text x="440" y="250" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" fill="#6b7178">GPL-3.0-or-later</text>
+  </g>
+
+  <!-- real proof: the actual timing difference, not a mockup -->
+  <g id="project-proof" transform="translate(700 64)">
+    <rect x="0" y="0" width="444" height="216" rx="12" fill="#131519" stroke="#23262b" stroke-width="1"/>
+
+    <text x="24" y="34" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#6b7178">typical TTS</text>
+    <rect x="24" y="44" width="396" height="22" rx="4" fill="#1c1d20"/>
+    <rect x="24" y="44" width="330" height="22" rx="4" fill="#23262b"/>
+    <text x="34" y="59" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#565b61">generating the full reply&#8230;</text>
+    <rect x="356" y="44" width="64" height="22" rx="4" fill="#3a3f45"/>
+    <text x="360" y="59" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#c9c2d9">speaks</text>
+
+    <text x="24" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#f2b84b">simplesay</text>
+    <rect x="24" y="110" width="396" height="22" rx="4" fill="#1c1d20"/>
+    <rect x="24" y="110" width="396" height="22" rx="4" fill="#241c16"/>
+    <rect x="52" y="110" width="368" height="22" rx="4" fill="url(#accentLine)" opacity="0.85"/>
+    <text x="62" y="125" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#1a1210">first sentence already speaking&#8230;</text>
+
+    <line x1="52" y1="70" x2="52" y2="106" stroke="#f2b84b" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="24" y="156" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#565b61">&#8593; same moment &#8212; one is still silent</text>
+
+    <text x="24" y="192" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#565b61">A real timing difference &#8212; not a mockup.</text>
+  </g>
+</svg>

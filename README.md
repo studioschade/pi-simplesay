@@ -1,4 +1,6 @@
-# SimpleSay
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="SimpleSay — a pi extension that speaks an agent's reply live while it is still streaming, instead of waiting for the full response to finish generating before speech starts.">
+</p>
 
 [Pi](https://pi.dev) is a terminal coding agent that supports extensions, small TypeScript/JavaScript modules that hook into its lifecycle to add commands, tools, and behavior. SimpleSay is one such extension: it voices an agent's replies automatically by watching the response stream.
 
@@ -38,7 +40,22 @@ contract. Point it at anything, whether a local model, a cloud voice API, or
 
 Switch at runtime: `/simplesay mode <tag|stream>`.
 
+## Install / run
+Symlink `src/index.ts` into pi's extension auto-discovery path (recommended, so this
+repo stays the single source of truth, with no manual sync needed):
+```bash
+ln -s /path/to/simplesay/src/index.ts ~/.pi/agent/extensions/simplesay.ts   # global
+# or
+ln -s /path/to/simplesay/src/index.ts .pi/extensions/simplesay.ts           # project-local
+```
+To try it ad hoc without installing: `pi -e /path/to/simplesay/src/index.ts`
+
 ## How it works
+
+<p align="center">
+  <img src="./assets/readme/pipeline.svg" width="100%" alt="Pipeline: message_update text_delta events feed the active mode's parser (stream or tag), which flushes speakable spans to clean(), which strips code/tables/markup, then dispatches via execFile with no shell involved; the next utterance synthesizes while the current one plays, so there's no dead air.">
+</p>
+
 - **Streaming input:** `pi.on("message_update")` delivers `assistantMessageEvent`, a
   union whose text arrives as `{ type: "text_delta", delta }`. Deltas feed the active
   mode's parser. Thinking and tool-call deltas are ignored, so neither is spoken.
@@ -86,16 +103,6 @@ Or override for just the current session:
 Defaults: `mode=stream` (hardcoded, since Pi has no persistent config store), `agent` and
 `endpoint` read from `SIMPLESAY_AGENT`/`SIMPLESAY_ENDPOINT` if set, otherwise
 `agent=fabricant` and the bundled example endpoint above.
-
-## Install / run
-Symlink `src/index.ts` into pi's extension auto-discovery path (recommended, so this
-repo stays the single source of truth, with no manual sync needed):
-```bash
-ln -s /path/to/simplesay/src/index.ts ~/.pi/agent/extensions/simplesay.ts   # global
-# or
-ln -s /path/to/simplesay/src/index.ts .pi/extensions/simplesay.ts           # project-local
-```
-To try it ad hoc without installing: `pi -e /path/to/simplesay/src/index.ts`
 
 ## Example: a Kokoro-based endpoint
 SimpleSay ships no TTS engine by design. It just shells out to whatever endpoint you

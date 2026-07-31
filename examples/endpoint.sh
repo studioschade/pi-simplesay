@@ -5,7 +5,7 @@
 #        ./endpoint.sh --play <wavfile>
 #
 # This endpoint reads configuration from tts.conf (in the same directory)
-# and supports multiple TTS providers: piper, espeak-ng, pico2wave
+# and supports multiple TTS providers: piper, espeak-ng, pico2wave, kokoro
 
 set -e
 
@@ -121,6 +121,42 @@ generate_pico2wave() {
     pico2wave -l "$PICO2WAVE_LANG" -w "$output" "$text" 2>/dev/null
 }
 
+# Function to generate WAV using Kokoro (OpenAI-compatible /v1/audio/speech)
+generate_kokoro() {
+    local text="$1"
+    local output="$2"
+
+    if ! command -v curl &> /dev/null; then
+        echo "[Endpoint] Error: curl not found (required for kokoro provider)"
+        return 1
+    fi
+
+    # jq not assumed present — build the JSON body with a small python/node-free
+    # approach: printf + sed-style escaping is fragile for arbitrary text, so
+    # use python3 (present on every box we run this on) to escape safely.
+    local payload
+    payload=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "model": sys.argv[1],
+    "input": sys.argv[2],
+    "voice": sys.argv[3],
+    "response_format": "wav",
+}))
+' "${KOKORO_MODEL:-kokoro}" "$text" "${KOKORO_VOICE:-am_puck}")
+
+    local http_code
+    http_code=$(curl -s -o "$output" -w '%{http_code}' \
+        "${KOKORO_URL:-http://127.0.0.1:7790}/v1/audio/speech" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+
+    if [ "$http_code" != "200" ]; then
+        echo "[Endpoint] Error: kokoro request failed (HTTP $http_code)"
+        return 1
+    fi
+}
+
 # Generate WAV based on provider
 if [ -n "$SAY_OUT" ]; then
     # Generate to specified output file
@@ -133,6 +169,9 @@ if [ -n "$SAY_OUT" ]; then
             ;;
         pico2wave)
             generate_pico2wave "$TEXT" "$SAY_OUT"
+            ;;
+        kokoro)
+            generate_kokoro "$TEXT" "$SAY_OUT"
             ;;
         *)
             echo "[Endpoint] Error: Unknown TTS provider: $TTS_PROVIDER"
@@ -158,6 +197,9 @@ else
             ;;
         pico2wave)
             generate_pico2wave "$TEXT" "$TEMP_WAV"
+            ;;
+        kokoro)
+            generate_kokoro "$TEXT" "$TEMP_WAV"
             ;;
         *)
             echo "[Endpoint] Error: Unknown TTS provider: $TTS_PROVIDER"
