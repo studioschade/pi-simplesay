@@ -1,7 +1,8 @@
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, type ChildProcess } from "node:child_process";
-import { unlink, realpathSync } from "node:fs";
+import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { promisify } from "node:util";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -46,10 +47,26 @@ class SimpleSayEditor extends CustomEditor {
 }
 
 export default function (pi: ExtensionAPI) {
-  // Defaults so voice works on load; /simplesay overrides for the session.
-  // Default to stream so it works with zero agent config (tag mode needs the
-  // agent to emit <say> markers).
-  let mode: Mode = "stream";
+  // Mode persists across sessions in a tiny JSON config, written only when
+  // changed via /simplesay mode (SIMPLESAY_CONFIG relocates it — the test
+  // suite uses that so it never touches the real file). A missing or corrupt
+  // file just falls back to the default: stream, so voice works with zero
+  // agent config (tag mode needs the agent to emit <say> markers).
+  const configFile = process.env.SIMPLESAY_CONFIG ?? join(homedir(), ".pi", "agent", "simplesay.json");
+  function loadMode(): Mode {
+    try {
+      const m = JSON.parse(readFileSync(configFile, "utf8")).mode;
+      if (m === "tag" || m === "stream") return m;
+    } catch { /* no config yet — use the default */ }
+    return "stream";
+  }
+  function saveMode() {
+    try {
+      mkdirSync(dirname(configFile), { recursive: true });
+      writeFileSync(configFile, JSON.stringify({ mode }, null, 2) + "\n");
+    } catch (e) { dbg(`config save FAIL: ${e}`); }
+  }
+  let mode: Mode = loadMode();
   // Voice identity: explicit env wins; else derive the agent from the working
   // dir (~/Agents/<name>, the box convention) so each agent speaks as ITSELF
   // with zero per-agent config; "fabricant" only as a last resort. This
@@ -96,9 +113,27 @@ export default function (pi: ExtensionAPI) {
   let muted = false;
   let currentPlayChild: ChildProcess | null = null;
 
+  // Debug tracing: one line per pipeline decision, so a silent session shows
+  // exactly where speech died (no events? muted? synth fail? play fail?).
+  // Defaults ON to /tmp (cleared on reboot, tiny volume); SIMPLESAY_DEBUG=0
+  // disables, or set SIMPLESAY_DEBUG=<path> to relocate.
+  const DEBUG = process.env.SIMPLESAY_DEBUG === "0" ? null : (process.env.SIMPLESAY_DEBUG ?? "/tmp/simplesay-debug.log");
+  function dbg(msg: string) {
+    if (!DEBUG) return;
+    try { appendFileSync(DEBUG, `${new Date().toISOString()} [${process.pid}] ${msg}\n`); } catch { /* never break speech over logging */ }
+  }
+  dbg(`loaded mode=${mode} agent=${agentName} endpoint=${endpoint}`);
+
+  // The exact commands speech will run, shown when an endpoint is connected
+  // (and in bare-status output) so a silent session can be debugged by running
+  // the same command by hand. Evaluated at call time — follows /simplesay changes.
+  const speakCmdPreview = () =>
+    `SAY_OUT=<tmp.wav> ${endpoint}${agentFlag ? ` --agent ${agentName}` : ""} "<text>"  ->  ${endpoint} --play <tmp.wav>`;
+
   function stopSpeaking() {
     epoch++;
     muted = true;
+    dbg(`barge-in: muted=true epoch=${epoch}`);
     if (currentPlayChild?.pid) {
       try { process.kill(-currentPlayChild.pid, "SIGTERM"); } catch { /* already exited */ }
       currentPlayChild = null;
@@ -109,6 +144,7 @@ export default function (pi: ExtensionAPI) {
     acc = buf = para = "";
     speaking = inFence = sawText = false;
     muted = false;
+    dbg(`reset: muted=false`);
   }
 
   // Provider-agnostic: strip everything that reads badly aloud, leave plain prose.
@@ -159,20 +195,26 @@ export default function (pi: ExtensionAPI) {
   }
 
   function speak(raw: string) {
-    if (muted) return; // interrupted mid-message; drop the rest silently
+    if (muted) { dbg(`speak DROPPED (muted): ${raw.length}ch`); return; } // interrupted mid-message; drop the rest silently
     const text = clean(raw);
-    if (!text || !endpoint) return;
+    if (!text || !endpoint) { dbg(`speak DROPPED (empty after clean): raw=${raw.length}ch`); return; }
+    dbg(`speak: "${text.slice(0, 60)}"`);
     const myEpoch = epoch;
     const args = agentFlag ? ["--agent", agentName, text] : [text];
     const wav = `/tmp/simplesay-${process.pid}-${seq++}.wav`;
 
     // Synthesize to a WAV ahead of playback (SAY_OUT skips the endpoint's play step).
+    // `timeout` is load-bearing: if the endpoint hangs (wedged TTS server —
+    // kokoro accepted connections but never answered, 2026-08-02), the synth
+    // promise would never settle and this serial chain would silently block
+    // EVERY later utterance for the rest of the session. Killing the child
+    // surfaces an error to .catch, which logs and lets the queue move on.
     const synth = (synthChain = synthChain
       .then(() => {
         if (myEpoch !== epoch) return false; // stopped before synth started
-        return execFileAsync(endpoint, args, { env: { ...process.env, SAY_OUT: wav } }).then(() => true);
+        return execFileAsync(endpoint, args, { env: { ...process.env, SAY_OUT: wav }, timeout: 90_000 }).then(() => true);
       })
-      .catch((e) => { console.error("[simplesay]", e); return false; }));
+      .catch((e) => { dbg(`synth FAIL: ${e}`); console.error("[simplesay]", e); return false; }));
 
     // Play in order once this utterance is ready, then clean up the WAV.
     playChain = playChain
@@ -317,9 +359,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("simplesay", {
-    description: "Configure SimpleSay voice: /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]",
+    description: "SimpleSay voice: /simplesay (status) | /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
+
+      // Bare command: report current state instead of erroring.
+      if (parts.length === 0) {
+        ctx.ui.notify(
+          `SimpleSay: mode=${mode}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}, config=${configFile}`,
+          "info",
+        );
+        ctx.ui.notify(`Speak runs: ${speakCmdPreview()}`, "info");
+        return;
+      }
 
       if (parts[0] === "mode") {
         const m = parts[1];
@@ -328,12 +380,13 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         mode = m;
-        ctx.ui.notify(`SimpleSay mode: ${mode}`, "info");
+        saveMode(); // persists across sessions
+        ctx.ui.notify(`SimpleSay mode: ${mode} (saved)`, "info");
         return;
       }
 
       if (parts.length < 2) {
-        ctx.ui.notify("Usage: /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]", "error");
+        ctx.ui.notify("Usage: /simplesay [mode <tag|stream> | <agent> <endpoint> [--no-agent]]", "error");
         return;
       }
       const [a, ep] = parts;
@@ -347,13 +400,25 @@ export default function (pi: ExtensionAPI) {
       endpoint = ep;
       agentFlag = !parts.includes("--no-agent");
       ctx.ui.notify(`SimpleSay: agent='${agentName}', endpoint='${endpoint}'`, "info");
+      ctx.ui.notify(`Speak runs: ${speakCmdPreview()}`, "info");
     },
+  });
+
+  // Reset on pi's message_start, which fires for EVERY assistant message,
+  // instead of relying on the provider stream's "start" event. Root cause of
+  // a total-silence bug: if the stream's start event never arrives (provider
+  // quirk, non-streaming path), the user's own typing sets muted=true and the
+  // ENTIRE reply is silently dropped at message_end. Barge-in still works:
+  // typing mid-stream re-mutes after this reset.
+  pi.on("message_start", (event) => {
+    if ((event.message as any).role === "assistant") reset();
   });
 
   pi.on("message_update", async (event) => {
     const a: any = (event as any).assistantMessageEvent;
-    if (!a) return;
+    if (!a) { dbg("message_update with no assistantMessageEvent"); return; }
     if (a.type === "start") { reset(); return; }
+    if (a.type !== "text_delta") dbg(`stream event: ${a.type}`);
     if (a.type === "text_delta" && typeof a.delta === "string") {
       sawText = true;
       acc += a.delta;

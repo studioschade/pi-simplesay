@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0 — 2026-08-02
+
+Found and fixed during a live total-silence incident (kokoro TTS server wedge
+plus two extension bugs it exposed); every fix verified against the running
+session's debug trace.
+
+- **Fixed total-silence bug: speech state now re-arms on pi's `message_start`
+  event instead of the provider stream's `start` event.** Providers that never
+  emit a stream `start` (observed with a Kimi/Code Fireworks setup: only
+  thinking/tool/text deltas arrive) left the interrupt-on-type `muted` flag
+  stuck after the user's own typing, so every reply was silently dropped at
+  `message_end` — no audio in any mode with a perfectly healthy TTS server.
+  Barge-in behavior is unchanged (typing mid-stream still mutes the rest).
+- **Fixed a permanent pipeline stall: synthesis now has a 90s timeout.** A
+  hung endpoint previously blocked the serial synth chain forever, silently
+  killing all speech for the rest of the session; now it skips one utterance
+  and the queue moves on. (Paired with a `--max-time` in `examples/endpoint.sh`
+  so a wedged kokoro server fails fast instead of hanging.)
+- **Mode persists across sessions** in `~/.pi/agent/simplesay.json`
+  (relocatable via `SIMPLESAY_CONFIG`, which the test suite uses so it never
+  touches the real file).
+- **Bare `/simplesay` now reports current settings** (mode, agent, endpoint,
+  config path) instead of showing a usage error. Connecting an endpoint (and the
+  bare status) also prints the exact synth/play commands speech will run, so a
+  silent session can be debugged by running the same command by hand.
+- **Added `examples/voice-manager.sh`** — piper voice management
+  (list/download/set), adopted from Alex's Raspberry Pi voice-box setup with
+  fixes from that review: `set` edits `tts.conf` (not `endpoint.sh`) and writes
+  the bare voice id (not a path), and a voice only counts as installed with both
+  `.onnx` and `.onnx.json` present.
+- **Debug tracing** (`SIMPLESAY_DEBUG`): one line per pipeline decision —
+  events seen, utterances spoken or dropped and why, synth failures — so a
+  silent session shows exactly where speech died.
+
 ## 0.2.0 — 2026-08-02
 
 - Renamed the npm package to `pi-simplesay` for pi ecosystem consistency and to

@@ -145,8 +145,13 @@ print(json.dumps({
 }))
 ' "${KOKORO_MODEL:-kokoro}" "$text" "${KOKORO_VOICE:-am_puck}")
 
+    # --max-time is mandatory: kokoro can wedge (accepts connections, never
+    # answers — observed 2026-08-02 when MemoryHigh sat below its baseline RSS).
+    # Without a timeout this curl hangs forever, which stalls the caller's
+    # serial synth queue and silently kills ALL speech for the session.
+    # On timeout curl exits non-zero and http_code is 000 -> we return 1 below.
     local http_code
-    http_code=$(curl -s -o "$output" -w '%{http_code}' \
+    http_code=$(curl -s --max-time "${KOKORO_TIMEOUT:-60}" -o "$output" -w '%{http_code}' \
         "${KOKORO_URL:-http://127.0.0.1:7790}/v1/audio/speech" \
         -H "Content-Type: application/json" \
         -d "$payload")

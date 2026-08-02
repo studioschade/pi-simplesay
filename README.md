@@ -38,7 +38,9 @@ contract. Point it at anything, whether a local model, a cloud voice API, or
 - **`tag`**: the agent wraps spoken text in `<say>…</say>`; spans are spoken live and the
   tags are stripped from the transcript. Requires the agent to emit the markers.
 
-Switch at runtime: `/simplesay mode <tag|stream>`.
+Switch at runtime: `/simplesay mode <tag|stream>` — the choice persists across
+sessions (stored in `~/.pi/agent/simplesay.json`). Run `/simplesay` with no
+arguments to see the current mode, agent, endpoint, and config path.
 
 ## Install / run
 
@@ -94,7 +96,18 @@ To try it ad hoc without installing: `pi -e /path/to/pi-simplesay/src/index.ts`
   air between utterances, synthesis is pipelined ahead of playback: each utterance
   renders to a temp WAV (`SAY_OUT`) while the previous one is still playing, then
   plays in order via `--play`. The next paragraph starts the instant the current one
-  finishes.
+  finishes. Synthesis has a 90s timeout: a hung endpoint (e.g. a wedged TTS server)
+  skips one utterance instead of silently freezing the queue for the whole session.
+- **Interrupt-on-type (barge-in):** the input editor is wrapped so any keystroke
+  stops current playback immediately and drops the rest of that reply's queued
+  speech — start typing and the agent goes quiet. Speech state re-arms on pi's
+  `message_start` event (which fires for every assistant message), not on the
+  provider stream's `start` event: providers that never emit one would otherwise
+  leave the mute flag stuck and drop entire replies silently.
+- **Debug tracing:** set `SIMPLESAY_DEBUG=/path/to/log` to record one line per
+  pipeline decision (events seen, utterances spoken or dropped and why, synth
+  failures) — a silent session shows exactly where speech died. `SIMPLESAY_DEBUG=0`
+  or unset disables it; `/tmp/simplesay-debug.log` is a good default.
 - **Display rewrite (tag mode only):** `message_end` returns a replacement message
   (`MessageEndEventResult.message`) with the tags removed. `message_update` is
   live-only and can't be rewritten, so raw tags are visible for the instant they
@@ -120,10 +133,11 @@ Or override for just the current session:
 ```
 /simplesay <agent> <endpoint> [--no-agent]
 ```
-Defaults: `mode=stream`. `endpoint` reads `SIMPLESAY_ENDPOINT` if set, otherwise
-the bundled example endpoint above. Voice identity reads `SIMPLESAY_AGENT` if set,
-otherwise derives from a `~/Agents/<name>` working directory when present, with
-`fabricant` only as the last-resort fallback.
+Defaults: `mode` starts as `stream`, then follows the last `/simplesay mode`
+choice saved to `~/.pi/agent/simplesay.json`. `endpoint` reads `SIMPLESAY_ENDPOINT`
+if set, otherwise the bundled example endpoint above. Voice identity reads
+`SIMPLESAY_AGENT` if set, otherwise derives from a `~/Agents/<name>` working
+directory when present, with `fabricant` only as the last-resort fallback.
 
 ## Example: a Kokoro-based endpoint
 SimpleSay ships no TTS engine by design. It just shells out to whatever endpoint you
@@ -160,7 +174,10 @@ are removed from the visible transcript afterward.
 ## Limitations
 - Tag mode shows raw tags for the instant they stream, before the finalize rewrite
   removes them.
-- Settings don't persist across sessions, since Pi has no config store.
+- Only the mode persists across sessions (`~/.pi/agent/simplesay.json`, relocatable
+  via `SIMPLESAY_CONFIG`); agent/endpoint overrides set by `/simplesay <agent>
+  <endpoint>` are per-session — use `SIMPLESAY_AGENT`/`SIMPLESAY_ENDPOINT` to pin
+  those permanently.
 - Tag mode depends on the model actually emitting the tags. That's reliable in
   practice, but not enforceable the way a schema-validated tool call would be.
 

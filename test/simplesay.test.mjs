@@ -65,9 +65,11 @@ fi
 `);
   fs.chmodSync(endpoint, 0o755);
 
-  const saved = { SIMPLESAY_ENDPOINT: process.env.SIMPLESAY_ENDPOINT, SIMPLESAY_LOG: process.env.SIMPLESAY_LOG, SIMPLESAY_AGENT: process.env.SIMPLESAY_AGENT };
+  const saved = { SIMPLESAY_ENDPOINT: process.env.SIMPLESAY_ENDPOINT, SIMPLESAY_LOG: process.env.SIMPLESAY_LOG, SIMPLESAY_AGENT: process.env.SIMPLESAY_AGENT, SIMPLESAY_CONFIG: process.env.SIMPLESAY_CONFIG, SIMPLESAY_DEBUG: process.env.SIMPLESAY_DEBUG };
   process.env.SIMPLESAY_ENDPOINT = endpoint;
   process.env.SIMPLESAY_LOG = log;
+  process.env.SIMPLESAY_CONFIG = path.join(dir, 'simplesay.json'); // never touch the real config
+  process.env.SIMPLESAY_DEBUG = '0';
   delete process.env.SIMPLESAY_AGENT;
 
   const h = harness(endpoint, log);
@@ -80,7 +82,7 @@ fi
     }
     fs.rmSync(dir, { recursive: true, force: true });
   }
-  return { ...h, log, cleanup };
+  return { ...h, endpoint, log, cleanup };
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -101,6 +103,36 @@ const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
 
 {
   const t = setup();
+  // Bare command reports current state instead of erroring.
+  await t.commands.simplesay.handler('', t.ctx);
+  const status = t.notices.find((n) => n.k === 'info');
+  check('bare /simplesay reports status', !!status && /mode=stream/.test(status.m) && /endpoint=/.test(status.m), JSON.stringify(t.notices));
+
+  // Mode persists: a fresh extension instance (same config file) restores it.
+  await t.commands.simplesay.handler('mode tag', t.ctx);
+  const h2 = harness(t.endpoint, t.log);
+  ext(h2.pi);
+  await h2.commands.simplesay.handler('', h2.ctx);
+  const status2 = h2.notices.find((n) => n.k === 'info');
+  check('mode persists across sessions', !!status2 && /mode=tag/.test(status2.m), JSON.stringify(h2.notices));
+  t.cleanup();
+}
+
+{
+  const t = setup();
+  // Connecting an endpoint prints the exact commands speech will run.
+  await t.commands.simplesay.handler(`testagent ${t.endpoint}`, t.ctx);
+  const preview = t.notices.find((n) => n.m.startsWith('Speak runs:'));
+  check('connect prints the speech command', !!preview && preview.m.includes(`--agent testagent`) && preview.m.includes('SAY_OUT=') && preview.m.includes('--play'), JSON.stringify(t.notices));
+  // Bare status shows it too, following the current agent/endpoint.
+  await t.commands.simplesay.handler('', t.ctx);
+  const statusPreview = t.notices.filter((n) => n.m.startsWith('Speak runs:')).pop();
+  check('bare status prints the speech command', !!statusPreview && statusPreview.m.includes('--agent testagent'), JSON.stringify(t.notices));
+  t.cleanup();
+}
+
+{
+  const t = setup();
   await t.commands.simplesay.handler('mode tag', t.ctx);
   t.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
   t.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: '<say>Hello tagged world</say> trailing prose' } });
@@ -108,7 +140,9 @@ const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
   await wait(400);
   const log = read(t.log);
   const stripped = result?.message?.content?.[0]?.text ?? '';
-  check('tag mode speaks tagged span', log.includes('SYNTH|fabricant|Hello tagged world'), log.trim().split('\n')[0] ?? 'no calls');
+  // Agent name derives from the cwd (~/Agents/<name>), so don't hardcode it —
+  // it differs per machine (fabricant on the box, sovy on the Pi).
+  check('tag mode speaks tagged span', /SYNTH\|[^|]*\|Hello tagged world/.test(log), log.trim().split('\n')[0] ?? 'no calls');
   check('tag mode strips say tags at message_end', !stripped.includes('<say>') && stripped.includes('Hello tagged world'), stripped);
   t.cleanup();
 }
