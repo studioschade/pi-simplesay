@@ -1,6 +1,6 @@
 {
-  "name": "simplesay",
-  "version": "0.1.0",
+  "name": "pi-simplesay",
+  "version": "0.2.0",
   "description": "Pi extension that speaks an agent's reply live while it's still streaming, not after generation finishes. Skips code/tables for free with zero extra tokens, and its tag mode gets reliable speech from small local models that flub tool calls. No bundled TTS, just shells out to any endpoint.",
   "type": "module",
   "keywords": ["pi-package"],
@@ -8,12 +8,21 @@
   "author": "Allen Schade",
   "repository": {
     "type": "git",
-    "url": "https://github.com/studioschade/simplesay"
+    "url": "https://github.com/studioschade/pi-simplesay"
   },
-  "homepage": "https://github.com/studioschade/simplesay",
-  "bugs": "https://github.com/studioschade/simplesay/issues",
+  "homepage": "https://github.com/studioschade/pi-simplesay",
+  "bugs": "https://github.com/studioschade/pi-simplesay/issues",
+  "files": [
+    "src",
+    "examples",
+    "assets",
+    "CHANGELOG.md"
+  ],
   "pi": {
     "extensions": ["./src"]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types test/simplesay.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

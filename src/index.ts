@@ -303,8 +303,12 @@ export default function (pi: ExtensionAPI) {
 
   // Barge-in: install the interrupt-on-type editor once the TUI is up.
   // Guarded by ctx.mode so RPC/JSON/print runs (no terminal editor) skip it.
+  // Also guard against session_start re-firing on a model change: without this,
+  // each re-fire wraps the previous SimpleSayEditor again, nesting wrappers.
+  let editorInstalled = false;
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
+    if (ctx.mode !== "tui" || editorInstalled) return;
+    editorInstalled = true;
     const previousFactory = ctx.ui.getEditorComponent?.();
     ctx.ui.setEditorComponent?.((tui, theme, keybindings) => {
       const base = previousFactory?.(tui, theme, keybindings) as any;

@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased — README redesign (2026-07-14)
+## 0.2.0 — 2026-08-02
+
+- Renamed the npm package to `pi-simplesay` for pi ecosystem consistency and to
+  avoid bare-name collisions; command stays `/simplesay`.
+- Packaged like a proper pi plugin: `files` allowlist, `npm test`, GitHub
+  Actions CI, and a self-test that drives stream/tag modes through a fake
+  speech endpoint (no audio played).
+- Fixed a model-change re-arm bug: `session_start` no longer nests the
+  interrupt-on-type editor wrapper each time it re-fires.
+
+## README redesign (2026-07-14)
 
 Same `beautify-github-readme` pass as simplecontext (Zulip #Builds > SimpleContext,
 Allen approved 2026-07-14), applied to this already-published repo.

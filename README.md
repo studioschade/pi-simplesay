@@ -41,14 +41,34 @@ contract. Point it at anything, whether a local model, a cloud voice API, or
 Switch at runtime: `/simplesay mode <tag|stream>`.
 
 ## Install / run
-Symlink `src/index.ts` into pi's extension auto-discovery path (recommended, so this
-repo stays the single source of truth, with no manual sync needed):
+
+This repo follows the pi package layout: `package.json` declares
+`pi.extensions = ["./src"]`, with the entrypoint at `src/index.ts`.
+
+Install from npm once published:
+
 ```bash
-ln -s /path/to/simplesay/src/index.ts ~/.pi/agent/extensions/simplesay.ts   # global
-# or
-ln -s /path/to/simplesay/src/index.ts .pi/extensions/simplesay.ts           # project-local
+pi install npm:pi-simplesay
 ```
-To try it ad hoc without installing: `pi -e /path/to/simplesay/src/index.ts`
+
+Install from GitHub:
+
+```bash
+pi install git:github.com/studioschade/pi-simplesay      # global
+# or
+pi install git:github.com/studioschade/pi-simplesay -l   # project-local
+```
+
+For a manual source checkout, symlink `src/index.ts` into pi's extension
+auto-discovery path (recommended, so this repo stays the single source of truth):
+
+```bash
+ln -s /path/to/pi-simplesay/src/index.ts ~/.pi/agent/extensions/simplesay.ts   # global
+# or
+ln -s /path/to/pi-simplesay/src/index.ts .pi/extensions/simplesay.ts           # project-local
+```
+
+To try it ad hoc without installing: `pi -e /path/to/pi-simplesay/src/index.ts`
 
 ## How it works
 
@@ -100,9 +120,10 @@ Or override for just the current session:
 ```
 /simplesay <agent> <endpoint> [--no-agent]
 ```
-Defaults: `mode=stream` (hardcoded, since Pi has no persistent config store), `agent` and
-`endpoint` read from `SIMPLESAY_AGENT`/`SIMPLESAY_ENDPOINT` if set, otherwise
-`agent=fabricant` and the bundled example endpoint above.
+Defaults: `mode=stream`. `endpoint` reads `SIMPLESAY_ENDPOINT` if set, otherwise
+the bundled example endpoint above. Voice identity reads `SIMPLESAY_AGENT` if set,
+otherwise derives from a `~/Agents/<name>` working directory when present, with
+`fabricant` only as the last-resort fallback.
 
 ## Example: a Kokoro-based endpoint
 SimpleSay ships no TTS engine by design. It just shells out to whatever endpoint you
