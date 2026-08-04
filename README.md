@@ -39,8 +39,12 @@ contract. Point it at anything, whether a local model, a cloud voice API, or
   tags are stripped from the transcript. Requires the agent to emit the markers.
 
 Switch at runtime: `/simplesay mode <tag|stream>` — the choice persists across
-sessions (stored in `~/.pi/agent/simplesay.json`). Run `/simplesay` with no
-arguments to see the current mode, agent, endpoint, and config path.
+sessions (stored in `~/.pi/agent/simplesay.json`). To silence speech entirely
+without uninstalling, `/simplesay disable` mutes everything (and cuts off
+anything already playing); `/simplesay enable` turns it back on. The on/off
+state persists across sessions too (`/simplesay on` / `off` also work). Run
+`/simplesay` with no arguments to see the current state: enabled/disabled,
+mode, agent, endpoint, and config path.
 
 ## Install / run
 
@@ -133,8 +137,9 @@ Or override for just the current session:
 ```
 /simplesay <agent> <endpoint> [--no-agent]
 ```
-Defaults: `mode` starts as `stream`, then follows the last `/simplesay mode`
-choice saved to `~/.pi/agent/simplesay.json`. `endpoint` reads `SIMPLESAY_ENDPOINT`
+Defaults: `mode` starts as `stream` and `enabled` as on, then both follow the
+last `/simplesay mode` / `/simplesay enable|disable` choices saved to
+`~/.pi/agent/simplesay.json`. `endpoint` reads `SIMPLESAY_ENDPOINT`
 if set, otherwise the bundled example endpoint above. Voice identity reads
 `SIMPLESAY_AGENT` if set, otherwise derives from a `~/Agents/<name>` working
 directory when present, with `fabricant` only as the last-resort fallback.
@@ -174,10 +179,11 @@ are removed from the visible transcript afterward.
 ## Limitations
 - Tag mode shows raw tags for the instant they stream, before the finalize rewrite
   removes them.
-- Only the mode persists across sessions (`~/.pi/agent/simplesay.json`, relocatable
-  via `SIMPLESAY_CONFIG`); agent/endpoint overrides set by `/simplesay <agent>
-  <endpoint>` are per-session — use `SIMPLESAY_AGENT`/`SIMPLESAY_ENDPOINT` to pin
-  those permanently.
+- Only the mode and the enabled/disabled switch persist across sessions
+  (`~/.pi/agent/simplesay.json`, relocatable via `SIMPLESAY_CONFIG`);
+  agent/endpoint overrides set by `/simplesay <agent> <endpoint>` are
+  per-session — use `SIMPLESAY_AGENT`/`SIMPLESAY_ENDPOINT` to pin those
+  permanently.
 - Tag mode depends on the model actually emitting the tags. That's reliable in
   practice, but not enforceable the way a schema-validated tool call would be.
 

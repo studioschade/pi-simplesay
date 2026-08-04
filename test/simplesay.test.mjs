@@ -120,6 +120,37 @@ const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
 
 {
   const t = setup();
+  // Disable: status reports it and nothing is spoken.
+  await t.commands.simplesay.handler('disable', t.ctx);
+  check('disable notifies', t.notices.some((n) => /disabled/.test(n.m)), JSON.stringify(t.notices));
+  await t.commands.simplesay.handler('', t.ctx);
+  const status = t.notices.find((n) => n.m.startsWith('SimpleSay:'));
+  check('bare status shows DISABLED', !!status && /DISABLED/.test(status.m), JSON.stringify(t.notices));
+  t.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+  t.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'This should never be spoken. Never ever.' } });
+  await t.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'This should never be spoken. Never ever.' }] } });
+  await wait(400);
+  check('disabled silences speech', read(t.log).trim() === '', read(t.log));
+
+  // Disabled state persists across sessions like mode does.
+  const h2 = harness(t.endpoint, t.log);
+  ext(h2.pi);
+  await h2.commands.simplesay.handler('', h2.ctx);
+  const status2 = h2.notices.find((n) => n.k === 'info');
+  check('disabled persists across sessions', !!status2 && /DISABLED/.test(status2.m), status2?.m);
+
+  // Re-enable (via the 'on' alias) and speech works again.
+  await t.commands.simplesay.handler('on', t.ctx);
+  t.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+  t.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Back from silence. Speech works again.' } });
+  await t.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Back from silence. Speech works again.' }] } });
+  await wait(400);
+  check('enable restores speech', /SYNTH\|/.test(read(t.log)), read(t.log));
+  t.cleanup();
+}
+
+{
+  const t = setup();
   // Connecting an endpoint prints the exact commands speech will run.
   await t.commands.simplesay.handler(`testagent ${t.endpoint}`, t.ctx);
   const preview = t.notices.find((n) => n.m.startsWith('Speak runs:'));

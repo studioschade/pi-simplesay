@@ -1,6 +1,6 @@
 {
   "name": "pi-simplesay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension that speaks an agent's reply live while it's still streaming, not after generation finishes. Skips code/tables for free with zero extra tokens, and its tag mode gets reliable speech from small local models that flub tool calls. No bundled TTS, just shells out to any endpoint.",
   "type": "module",
   "keywords": ["pi-package"],

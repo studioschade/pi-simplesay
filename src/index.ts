@@ -53,20 +53,29 @@ export default function (pi: ExtensionAPI) {
   // file just falls back to the default: stream, so voice works with zero
   // agent config (tag mode needs the agent to emit <say> markers).
   const configFile = process.env.SIMPLESAY_CONFIG ?? join(homedir(), ".pi", "agent", "simplesay.json");
-  function loadMode(): Mode {
+  function loadConfig(): { mode: Mode; enabled: boolean } {
     try {
-      const m = JSON.parse(readFileSync(configFile, "utf8")).mode;
-      if (m === "tag" || m === "stream") return m;
-    } catch { /* no config yet — use the default */ }
-    return "stream";
+      const c = JSON.parse(readFileSync(configFile, "utf8"));
+      const m = c.mode;
+      return {
+        mode: m === "tag" || m === "stream" ? m : "stream",
+        // Config written before `enabled` existed just lacks the key → on.
+        enabled: c.enabled !== false,
+      };
+    } catch { /* no config yet — use the defaults */ }
+    return { mode: "stream", enabled: true };
   }
-  function saveMode() {
+  function saveConfig() {
     try {
       mkdirSync(dirname(configFile), { recursive: true });
-      writeFileSync(configFile, JSON.stringify({ mode }, null, 2) + "\n");
+      writeFileSync(configFile, JSON.stringify({ mode, enabled }, null, 2) + "\n");
     } catch (e) { dbg(`config save FAIL: ${e}`); }
   }
-  let mode: Mode = loadMode();
+  const loaded = loadConfig();
+  let mode: Mode = loaded.mode;
+  // Master switch: /simplesay disable mutes all speech until re-enabled.
+  // Persists like mode, so a muted session stays muted across restarts.
+  let enabled: boolean = loaded.enabled;
   // Voice identity: explicit env wins; else derive the agent from the working
   // dir (~/Agents/<name>, the box convention) so each agent speaks as ITSELF
   // with zero per-agent config; "fabricant" only as a last resort. This
@@ -122,7 +131,7 @@ export default function (pi: ExtensionAPI) {
     if (!DEBUG) return;
     try { appendFileSync(DEBUG, `${new Date().toISOString()} [${process.pid}] ${msg}\n`); } catch { /* never break speech over logging */ }
   }
-  dbg(`loaded mode=${mode} agent=${agentName} endpoint=${endpoint}`);
+  dbg(`loaded mode=${mode} enabled=${enabled} agent=${agentName} endpoint=${endpoint}`);
 
   // The exact commands speech will run, shown when an endpoint is connected
   // (and in bare-status output) so a silent session can be debugged by running
@@ -195,6 +204,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function speak(raw: string) {
+    if (!enabled) { dbg(`speak DROPPED (disabled): ${raw.length}ch`); return; } // /simplesay disable — silence everything
     if (muted) { dbg(`speak DROPPED (muted): ${raw.length}ch`); return; } // interrupted mid-message; drop the rest silently
     const text = clean(raw);
     if (!text || !endpoint) { dbg(`speak DROPPED (empty after clean): raw=${raw.length}ch`); return; }
@@ -359,14 +369,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("simplesay", {
-    description: "SimpleSay voice: /simplesay (status) | /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]",
+    description: "SimpleSay voice: /simplesay (status) | /simplesay enable|disable | /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
 
       // Bare command: report current state instead of erroring.
       if (parts.length === 0) {
         ctx.ui.notify(
-          `SimpleSay: mode=${mode}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}, config=${configFile}`,
+          `SimpleSay: ${enabled ? "enabled" : "DISABLED"}, mode=${mode}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}, config=${configFile}`,
           "info",
         );
         ctx.ui.notify(`Speak runs: ${speakCmdPreview()}`, "info");
@@ -380,13 +390,24 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         mode = m;
-        saveMode(); // persists across sessions
+        saveConfig(); // persists across sessions
         ctx.ui.notify(`SimpleSay mode: ${mode} (saved)`, "info");
         return;
       }
 
+      // Master switch, on aliases included so /simplesay on/off do the
+      // obvious thing too. Toggling back on re-arms immediately — the next
+      // assistant message speaks normally.
+      if (parts[0] === "enable" || parts[0] === "on" || parts[0] === "disable" || parts[0] === "off") {
+        enabled = parts[0] === "enable" || parts[0] === "on";
+        saveConfig(); // persists across sessions
+        if (!enabled) stopSpeaking(); // cut off anything playing/queued right now
+        ctx.ui.notify(`SimpleSay ${enabled ? "enabled" : "disabled"} (saved)`, "info");
+        return;
+      }
+
       if (parts.length < 2) {
-        ctx.ui.notify("Usage: /simplesay [mode <tag|stream> | <agent> <endpoint> [--no-agent]]", "error");
+        ctx.ui.notify("Usage: /simplesay [enable|disable | mode <tag|stream> | <agent> <endpoint> [--no-agent]]", "error");
         return;
       }
       const [a, ep] = parts;

@@ -18,6 +18,11 @@ session's debug trace.
   killing all speech for the rest of the session; now it skips one utterance
   and the queue moves on. (Paired with a `--max-time` in `examples/endpoint.sh`
   so a wedged kokoro server fails fast instead of hanging.)
+- **Added a master on/off switch: `/simplesay disable` / `/simplesay enable`
+  (`on`/`off` also accepted).** Disabled silences all speech — anything playing
+  is cut off immediately and nothing new queues — without uninstalling the
+  extension or changing mode. The state persists across sessions alongside
+  mode in the config file; a bare `/simplesay` shows it as the first field.
 - **Mode persists across sessions** in `~/.pi/agent/simplesay.json`
   (relocatable via `SIMPLESAY_CONFIG`, which the test suite uses so it never
   touches the real file).
