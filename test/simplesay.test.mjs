@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -175,6 +176,78 @@ const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
   // it differs per machine (fabricant on the box, sovy on the Pi).
   check('tag mode speaks tagged span', /SYNTH\|[^|]*\|Hello tagged world/.test(log), log.trim().split('\n')[0] ?? 'no calls');
   check('tag mode strips say tags at message_end', !stripped.includes('<say>') && stripped.includes('Hello tagged world'), stripped);
+  t.cleanup();
+}
+
+// --- orphan-prevention tests: wedged audio player must not hold pi alive ---
+// A detached play child keeps pi's event loop alive via its stdio pipes; if
+// the player wedges (accepts the file, never exits) pi orphans on quit. Both
+// halves of the fix are exercised: the playWav timeout (hard bound) and the
+// session_shutdown handler (courtesy flush). Observable: the wedged endpoint
+// logs PLAY-START on entry and PLAY-END only if it completes its sleep — a
+// kill (by timeout or by shutdown) prevents PLAY-END from ever appearing.
+{
+  const t = setup();
+  process.env.SIMPLESAY_PLAY_TIMEOUT_MS = '300';
+  fs.writeFileSync(t.endpoint, `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then
+  echo "PLAY-START|$2" >> "$log"
+  sleep 10
+  echo "PLAY-END|$2" >> "$log"
+  exit 0
+fi
+agent=""
+if [ "$1" = "--agent" ]; then agent="$2"; shift 2; fi
+text="$*"
+if [ -n "$SAY_OUT" ]; then printf 'wav' > "$SAY_OUT"; echo "SYNTH|$agent|$text" >> "$log"; fi
+`);
+  fs.chmodSync(t.endpoint, 0o755);
+  t.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+  t.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Wedged player test sentence for the timeout kill path.' } });
+  await t.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Wedged player test sentence for the timeout kill path.' }] } });
+  await wait(900); // > 300ms timeout + margin, well under the 10s sleep
+  const log = read(t.log);
+  check('playWav timeout kills a wedged player', /PLAY-START/.test(log) && !/PLAY-END/.test(log), log.trim().split('\n').join(' | '));
+  // The kill must reach the grandchild `sleep`, not just the wrapper — a
+  // leftover is exactly the orphan we're preventing. (Checks the whole process
+  // table, not just our pid tree, since the child is detached.)
+  let leftover = '';
+  try { leftover = execSync('pgrep -af "sleep 10" | grep -v grep || true').toString().trim(); } catch {}
+  check('playWav timeout leaves no wedged sleep', leftover === '', leftover || '(clean)');
+  delete process.env.SIMPLESAY_PLAY_TIMEOUT_MS;
+  t.cleanup();
+}
+
+{
+  const t = setup();
+  process.env.SIMPLESAY_PLAY_TIMEOUT_MS = '60000'; // long: shutdown is what kills it, not the timer
+  fs.writeFileSync(t.endpoint, `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then
+  echo "PLAY-START|$2" >> "$log"
+  sleep 10
+  echo "PLAY-END|$2" >> "$log"
+  exit 0
+fi
+agent=""
+if [ "$1" = "--agent" ]; then agent="$2"; shift 2; fi
+text="$*"
+if [ -n "$SAY_OUT" ]; then printf 'wav' > "$SAY_OUT"; echo "SYNTH|$agent|$text" >> "$log"; fi
+`);
+  fs.chmodSync(t.endpoint, 0o755);
+  t.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+  t.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Wedged player test sentence for the shutdown kill path.' } });
+  await t.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Wedged player test sentence for the shutdown kill path.' }] } });
+  await wait(400); // let synth + play spawn so PLAY-START is logged
+  await t.handlers.session_shutdown();
+  await wait(400);
+  const log = read(t.log);
+  check('session_shutdown kills a wedged player', /PLAY-START/.test(log) && !/PLAY-END/.test(log), log.trim().split('\n').join(' | '));
+  let leftover2 = '';
+  try { leftover2 = execSync('pgrep -af "sleep 10" | grep -v grep || true').toString().trim(); } catch {}
+  check('session_shutdown leaves no wedged sleep', leftover2 === '', leftover2 || '(clean)');
+  delete process.env.SIMPLESAY_PLAY_TIMEOUT_MS;
   t.cleanup();
 }
 

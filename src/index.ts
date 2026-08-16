@@ -1,5 +1,5 @@
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
@@ -187,19 +187,55 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Plays a WAV via the endpoint, keeping a handle to the child process so
-  // stopSpeaking() can kill it mid-playback. `detached: true` makes the
-  // child its own process-group leader, so killing `-pid` also reaches the
-  // audio player it shells out to (aplay/paplay/pw-play), not just the
-  // wrapper script.
+  // stopSpeaking() can kill it mid-playback, and bounding it so a wedged
+  // player can't orphan pi on quit.
+  //
+  // Spawn with `detached: true` + `stdio: 'ignore'` + `unref()` is what
+  // ACTUALLY makes the child its own session/process-group leader (setsid).
+  // execFile with `detached: true` alone does NOT — its child stays in pi's
+  // process group, so `process.kill(-child.pid)` ESRCH's and the audio player
+  // the wrapper shelled out to (aplay/paplay/pw-play) leaks. That was a latent
+  // bug in stopSpeaking()'s barge-in too; switching the play child to a real
+  // session leader fixes both — a negative-pid kill now reaches the whole
+  // group, player included. `unref()` is the second orphan defence: the child
+  // no longer keeps pi's event loop alive via stdio pipes, so pi can quit even
+  // if the player hangs (the timeout + shutdown handler are the belt to this
+  // suspender).
+  //
+  // `playTimeoutMs` is the hard bound: a wedged audio player (hung PipeWire,
+  // absent device — accepts the file then never exits) would otherwise play
+  // forever after pi quits. The timer kills the whole process group (negative
+  // pid, like stopSpeaking). Override via SIMPLESAY_PLAY_TIMEOUT_MS.
   function playWav(wav: string, myEpoch: number): Promise<void> {
     return new Promise((resolve) => {
       if (myEpoch !== epoch) { resolve(); return; }
-      const child = execFile(endpoint, ["--play", wav], { detached: true }, (err) => {
-        if (err && (err as any).signal !== "SIGTERM") console.error("[simplesay]", err);
-        resolve();
-      });
+      const playTimeoutMs = Number(process.env.SIMPLESAY_PLAY_TIMEOUT_MS) || 120_000;
+      const child = spawn(endpoint, ["--play", wav], { detached: true, stdio: "ignore" });
+      child.unref();
       currentPlayChild = child;
-      child.on("exit", () => { if (currentPlayChild === child) currentPlayChild = null; });
+      let killTimer: NodeJS.Timeout | undefined;
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (currentPlayChild === child) currentPlayChild = null;
+        resolve();
+      };
+      child.on("exit", (code, signal) => {
+        if (signal !== "SIGTERM" && code !== 0 && code !== null) console.error("[simplesay]", `player exited code=${code} signal=${signal}`);
+        finish();
+      });
+      child.on("error", (err) => {
+        console.error("[simplesay]", err);
+        finish();
+      });
+      killTimer = setTimeout(() => {
+        if (currentPlayChild === child && child.pid) {
+          dbg(`play TIMEOUT (${playTimeoutMs}ms): killing group -${child.pid}`);
+          try { process.kill(-child.pid, "SIGTERM"); } catch { /* already exited */ }
+        }
+      }, playTimeoutMs);
     });
   }
 
@@ -473,5 +509,14 @@ export default function (pi: ExtensionAPI) {
         : c,
     );
     return { message: { ...msg, content } };
+  });
+
+  // Kill any in-flight playback on shutdown so a detached, wedged audio child
+  // can't hold pi's event loop alive after the session ends (the playWav
+  // timeout is the hard bound; this is the courtesy flush that ends cleanly).
+  // Bounded at 5 s by pi's session_shutdown cap (0.84.2+fortshady.1);
+  // stopSpeaking is synchronous and well within that.
+  pi.on("session_shutdown", async () => {
+    stopSpeaking();
   });
 }

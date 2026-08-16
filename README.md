@@ -102,6 +102,11 @@ To try it ad hoc without installing: `pi -e /path/to/pi-simplesay/src/index.ts`
   plays in order via `--play`. The next paragraph starts the instant the current one
   finishes. Synthesis has a 90s timeout: a hung endpoint (e.g. a wedged TTS server)
   skips one utterance instead of silently freezing the queue for the whole session.
+  Playback is spawned as its own session leader and `unref()`'d, with a
+  `SIMPLESAY_PLAY_TIMEOUT_MS` (default 120 s) group-kill bound, and a
+  `session_shutdown` handler kills any in-flight playback on quit — so a wedged
+  audio player (hung PipeWire, absent device) can't hold Pi's event loop alive and
+  orphan it on exit. Barge-in's group kill reaches the player too.
 - **Interrupt-on-type (barge-in):** the input editor is wrapped so any keystroke
   stops current playback immediately and drops the rest of that reply's queued
   speech — start typing and the agent goes quiet. Speech state re-arms on pi's
@@ -132,6 +137,7 @@ editing the source, set environment variables before starting Pi:
 ```bash
 export SIMPLESAY_ENDPOINT=/path/to/your/say/script
 export SIMPLESAY_AGENT=your-agent-name   # optional, defaults to 'fabricant'
+export SIMPLESAY_PLAY_TIMEOUT_MS=120000  # optional, play-kill bound in ms (default 120s)
 ```
 Or override for just the current session:
 ```

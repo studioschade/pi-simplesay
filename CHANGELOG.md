@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.1 — 2026-08-16
+
+Orphan-prevention hardening on the play path, surfaced during a six-hour pi
+orphan investigation (the orphan's actual trigger is still OPEN — this fix
+closes a real bug of the same class, not the trigger itself).
+
+- **Bounded playback with a timeout + process-group kill.** `playWav` spawned
+  the audio player via `execFile(..., { detached: true })` with no timeout, so a
+  wedged player (hung PipeWire, absent device — accepts the file then never
+  exits) held pi's event loop alive indefinitely via the child's stdio pipes —
+  the same orphan class as a blocking `session_shutdown` handler, on the play
+  path. Now a timer kills the whole process group (negative pid, like
+  `stopSpeaking`) after `SIMPLESAY_PLAY_TIMEOUT_MS` (default 120 s; overridable
+  so a long-utterance setup can tune it). The synth path was already bounded
+  (90 s `execFile` timeout + `curl --max-time 60` in the endpoint).
+- **Fixed the play child actually becoming a session leader (latent barge-in
+  bug).** `execFile` with `detached: true` does NOT call `setsid()` — the child
+  stays in pi's process group, so `process.kill(-child.pid)` ESRCH's and the
+  audio player the wrapper shelled out to leaks. `stopSpeaking()`'s
+  interrupt-on-type relied on that same negative-pid group kill, so barge-in
+  only "worked" because real utterances are short enough to end on their own;
+  a long/hung utterance would have kept playing after the user typed. Switched
+  `playWav` to `spawn({ detached: true, stdio: 'ignore' })` + `unref()`, which
+  really does `setsid()` — now the group kill reaches the player, and `unref()`
+  means a wedged child no longer holds pi's event loop at all (timeout +
+  shutdown handler are belt to that suspender).
+- **Added a `session_shutdown` handler that calls `stopSpeaking()`.** Kills any
+  in-flight playback on quit so a detached audio child can't outlive the
+  session. The playWav timeout is the hard bound; this is the courtesy flush
+  that ends cleanly. Bounded at 5 s by pi's `session_shutdown` cap
+  (`0.84.2+fortshady.1`); `stopSpeaking` is synchronous and well within that.
+
 ## 0.3.0 — 2026-08-02
 
 Found and fixed during a live total-silence incident (kokoro TTS server wedge
