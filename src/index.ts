@@ -1,6 +1,6 @@
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, accessSync, constants } from "node:fs";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -98,6 +98,24 @@ export default function (pi: ExtensionAPI) {
   const bundledDefault = join(dirname(realPath), "..", "examples", "endpoint.sh");
   let endpoint = process.env.SIMPLESAY_ENDPOINT ?? bundledDefault;
   let agentFlag = true;
+
+  // A TTS extension must NEVER crash or spam the agent because speech failed.
+  // Preflight the endpoint once: if it is missing or not executable, disable
+  // voice for the session with ONE clear warning instead of erroring on every
+  // utterance. A present-but-failing endpoint (an unreachable TTS server, a
+  // wrong host — the 2026-08-30 "kokoro on core, not halo" crash) is caught at
+  // runtime by the synth circuit-breaker below, which pauses after a few tries.
+  let endpointUsable = true;
+  function checkEndpoint(): boolean {
+    try { accessSync(endpoint, constants.X_OK); return true; }
+    catch {
+      console.warn(`[simplesay] endpoint not found or not executable: ${endpoint} — voice disabled this session (set SIMPLESAY_ENDPOINT to a working one, then /simplesay enable)`);
+      return false;
+    }
+  }
+  endpointUsable = checkEndpoint();
+  let synthFails = 0;                                                  // consecutive synth failures
+  const SYNTH_FAIL_LIMIT = Number(process.env.SIMPLESAY_FAIL_LIMIT) || 3;
 
   // Per-message stream state.
   let acc = "";         // streamed text not yet parsed
@@ -242,6 +260,7 @@ export default function (pi: ExtensionAPI) {
   function speak(raw: string) {
     if (!enabled) { dbg(`speak DROPPED (disabled): ${raw.length}ch`); return; } // /simplesay disable — silence everything
     if (muted) { dbg(`speak DROPPED (muted): ${raw.length}ch`); return; } // interrupted mid-message; drop the rest silently
+    if (!endpointUsable) { dbg(`speak DROPPED (endpoint unusable)`); return; } // preflight/circuit-breaker tripped — already warned once, stay quiet
     const text = clean(raw);
     if (!text || !endpoint) { dbg(`speak DROPPED (empty after clean): raw=${raw.length}ch`); return; }
     dbg(`speak: "${text.slice(0, 60)}"`);
@@ -258,9 +277,23 @@ export default function (pi: ExtensionAPI) {
     const synth = (synthChain = synthChain
       .then(() => {
         if (myEpoch !== epoch) return false; // stopped before synth started
-        return execFileAsync(endpoint, args, { env: { ...process.env, SAY_OUT: wav }, timeout: 90_000 }).then(() => true);
+        return execFileAsync(endpoint, args, { env: { ...process.env, SAY_OUT: wav }, timeout: 90_000 })
+          .then(() => { synthFails = 0; return true; }); // a success clears the circuit-breaker
       })
-      .catch((e) => { dbg(`synth FAIL: ${e}`); console.error("[simplesay]", e); return false; }));
+      .catch((e) => {
+        dbg(`synth FAIL: ${e}`);
+        synthFails++;
+        // Degrade, don't spam: warn up to the limit, then pause voice for the
+        // session (circuit-breaker) so a wedged/misconfigured endpoint can't
+        // print a "Command failed" wall on every utterance and read as a crash.
+        if (synthFails <= SYNTH_FAIL_LIMIT)
+          console.warn(`[simplesay] speech failed via ${endpoint} (${synthFails}/${SYNTH_FAIL_LIMIT}) — is the TTS endpoint reachable?`);
+        if (synthFails >= SYNTH_FAIL_LIMIT) {
+          endpointUsable = false;
+          console.warn(`[simplesay] endpoint failed ${SYNTH_FAIL_LIMIT}×; voice paused for this session — fix the endpoint and /simplesay enable to retry`);
+        }
+        return false;
+      }));
 
     // Play in order once this utterance is ready, then clean up the WAV.
     playChain = playChain
@@ -436,6 +469,7 @@ export default function (pi: ExtensionAPI) {
       // assistant message speaks normally.
       if (parts[0] === "enable" || parts[0] === "on" || parts[0] === "disable" || parts[0] === "off") {
         enabled = parts[0] === "enable" || parts[0] === "on";
+        if (enabled) { synthFails = 0; endpointUsable = checkEndpoint(); } // re-arm the circuit-breaker + re-preflight
         saveConfig(); // persists across sessions
         if (!enabled) stopSpeaking(); // cut off anything playing/queued right now
         ctx.ui.notify(`SimpleSay ${enabled ? "enabled" : "disabled"} (saved)`, "info");

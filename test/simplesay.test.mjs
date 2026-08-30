@@ -251,5 +251,35 @@ if [ -n "$SAY_OUT" ]; then printf 'wav' > "$SAY_OUT"; echo "SYNTH|$agent|$text" 
   t.cleanup();
 }
 
+{
+  // Regression: a missing / non-executable endpoint must NOT crash the agent — it
+  // degrades to silence with a SINGLE warning, never a per-utterance error wall.
+  // (The 2026-08-30 halo crash: the endpoint curled a TTS server that wasn't there
+  // and errored on every utterance, reading like a crash.)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-simplesay-noEP-'));
+  const saved = { SIMPLESAY_ENDPOINT: process.env.SIMPLESAY_ENDPOINT, SIMPLESAY_CONFIG: process.env.SIMPLESAY_CONFIG, SIMPLESAY_DEBUG: process.env.SIMPLESAY_DEBUG };
+  process.env.SIMPLESAY_ENDPOINT = path.join(dir, 'does-not-exist.sh');
+  process.env.SIMPLESAY_CONFIG = path.join(dir, 'simplesay.json');
+  process.env.SIMPLESAY_DEBUG = '0';
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warns.push(a.map(String).join(' '));
+  let threw = false;
+  try {
+    const h = harness(process.env.SIMPLESAY_ENDPOINT, '');
+    ext(h.pi); // activation runs the endpoint preflight
+    h.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+    h.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'This must not crash. ' } });
+    await h.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'This must not crash.' }] } });
+    await wait(200);
+  } catch { threw = true; }
+  console.warn = origWarn;
+  check('missing endpoint does not crash', !threw);
+  check('missing endpoint warns exactly once (not per-utterance)',
+    warns.filter((w) => /not found or not executable/.test(w)).length === 1, `${warns.length} warn(s)`);
+  for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

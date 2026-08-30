@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2 — 2026-08-30
+
+Resilience: a speech failure must never crash or spam the agent.
+
+- **Endpoint preflight.** On load, check the endpoint exists and is executable
+  (`accessSync X_OK`). If not, voice is disabled for the session with ONE clear
+  warning instead of erroring on every utterance.
+- **Synth circuit-breaker.** A present-but-failing endpoint (unreachable TTS
+  server, wrong host — the 2026-08-30 "kokoro on core, not halo" crash) now
+  warns up to `SIMPLESAY_FAIL_LIMIT` (default 3) consecutive failures, then
+  pauses voice for the session. A success resets the counter; `/simplesay
+  enable` re-preflights and re-arms it.
+- **Quieter failures.** The raw `Command failed: …<full spoken text>` dump is
+  replaced by a concise, actionable warning.
+- Regression test: a missing endpoint degrades to silence with exactly one
+  warning, never a crash.
+
 ## 0.3.1 — 2026-08-16
 
 Orphan-prevention hardening on the play path, surfaced during a six-hour pi
