@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.5.0 — 2026-10-01
+
+A declared **direct transport** for endpoints that cannot write a WAV, WAV success that
+means a WAV exists, and a plain-language switch for where the voice plays.
+
+- **`/simplesay output local|server`.** Chooses where the voice comes out, in user terms:
+  `local` plays the endpoint's WAV on this device (the WAV transport), `server` hands each
+  span to the endpoint, which plays it wherever it plays, with nothing returned (the
+  direct transport). `/simplesay output` alone shows the current output and its source
+  (`env`, `setting` or `default`). It is an alias over the same saved `direct` setting, so
+  no new config key and no change for existing users; `/simplesay direct on|off` keeps
+  working, and `SIMPLESAY_DIRECT` still overrides both (the command says so when it does).
+  Bare `/simplesay` now shows `output=local|server (<source>)` next to `transport=`.
+- **`examples/endpoint-remote-ssh.sh`.** A generic endpoint for TTS that runs on another
+  machine over SSH. `local`: pipes the text (and an optional `#instruction <tone>` line)
+  to `ssh $SIMPLESAY_REMOTE_HOST $SIMPLESAY_REMOTE_CMD`, writes the returned WAV to
+  `SAY_OUT` via a `.part` file (empty or failed = non-zero), and plays `--play <wav>` with
+  the first of pw-play / paplay / aplay / afplay. `server`: runs the remote command with a
+  play-here flag (`--play-here` by convention, `SIMPLESAY_REMOTE_PLAY_FLAG` to change it).
+
+- **WAV success requires a WAV.** In the default transport a span succeeds only if the
+  endpoint leaves a regular, non-empty file at `SAY_OUT`. Exit 0 with a missing or empty
+  file is a failed span: it never reaches `--play` and counts toward the circuit-breaker.
+  (Found with a sandboxed endpoint that hands the text to a relay, ignores `SAY_OUT`,
+  and exits 0 — the later `--play` then failed.)
+- **Direct transport (opt-in).** `SIMPLESAY_DIRECT=1` or `/simplesay direct on`: one
+  ordered `<endpoint> [--agent <name>] "<text>"` call per span, no synth-ahead, no temp
+  WAV, no `--play`; an inherited `SAY_OUT` is removed from the child env; agent args and
+  `SAY_INSTRUCTION` are unchanged. `SIMPLESAY_DIRECT=0` overrides a saved `direct: true`;
+  unset uses the saved setting, default off. The setting persists alongside mode/enabled.
+  Bare `/simplesay` shows `transport=<wav|direct> (<env|setting|default>)`.
+- **Honest receipts.** Direct calls log `receipt: accepted (direct)`, never `played`; for a
+  relay endpoint that means accepted by the relay's queue.
+- **Bounded cancellation.** Direct calls run as their own process group, bounded by
+  `SIMPLESAY_DIRECT_TIMEOUT_MS` (default 120 s). Timeout, barge-in, disable and shutdown
+  send the group SIGTERM, then SIGKILL after `SIMPLESAY_KILL_GRACE_MS` (default 1 s), so
+  a TERM-ignoring endpoint, or a TERM-ignoring descendant of a wrapper that exited, cannot
+  survive. The outcome is recorded immediately, but calls never overlap: the next direct
+  call or `--play` waits at a teardown barrier until the old process group is gone,
+  bounded by the grace plus `SIMPLESAY_REAP_MS` (default 500 ms). The barrier holds across
+  cancellation, disable/enable and the next reply. The play-timeout and barge-in kills of
+  the WAV player use the same escalation and barrier. In the WAV transport barge-in /
+  disable / shutdown now also abort an in-flight synth wrapper (it was left to run out its
+  90 s timeout).
+- **Teardown fails closed.** Only `ESRCH` counts as a gone process group. A signal error
+  other than `ESRCH` (e.g. `EPERM`), or a group still present at grace + reap, is an
+  unconfirmed teardown: it logs `teardown FAILED (unconfirmed)`, latches a held state
+  (queued spans settle as refused, new spans refused at once, both transports), and shows
+  `speech HELD` in bare `/simplesay` status. `/simplesay enable` re-probes the recorded
+  groups and releases only when every one returns `ESRCH`; otherwise it stays held and
+  says why. Confirmed teardown keeps the bounded-progress behaviour; shutdown still kills
+  without waiting. Group signals go through an exported `__test.signal` seam (production
+  still calls `process.kill`) so tests can inject faults.
+- **Termination beats the exit code.** A timed-out direct call is a failure (counts toward
+  the breaker) and a cancelled one gets a `cancelled` receipt, even if the endpoint then
+  exits 0 on SIGTERM; neither is `accepted` and neither resets the breaker. Same for the
+  WAV player: exit 0 after a timeout is `play FAIL: timed out`, after barge-in / disable /
+  shutdown it is `receipt: cancelled (play)`; only an uninterrupted exit 0 is `played`.
+- **Breaker checked at dispatch (pre-existing gap).** A span queued before the breaker
+  tripped no longer invokes the endpoint once it has: eight prequeued failing WAV spans
+  with limit 3 now make exactly three calls (previously all eight, while status said
+  PAUSED). Same check on the direct path.
+- **Span failures no longer print to the terminal.** The synth/play `console.warn` /
+  `console.error` paths now write to the debug log only; a tripped circuit-breaker shows
+  as `voice PAUSED` in bare `/simplesay` status. (Whether those prints caused ghost
+  lines seen in a Pi TUI is unconfirmed; this removes them either way.) The
+  load-time "endpoint not found" preflight warning is unchanged.
+- Tests (157 total, offline). Output toggle (17 new): `output server` persists
+  `direct: true` and the next span is exactly one endpoint call with no `--play`; `output
+  local` persists `direct: false` and uses synth + `--play`; bare `output` reports value
+  and source; the env override is reported; bad values are refused.
+- Tests for the direct transport and teardown (118 new at the time, offline): rc 0 with missing and with empty WAV; inherited `SAY_OUT` not
+  reaching a direct child; one call per span and zero `--play`; strict ordering;
+  precedence env 1 / env 0 / setting / default and persistence across mode/enable saves;
+  shutdown, disable and timeout cancellation with no leftover child; synth abort on
+  shutdown; independent review cases (a TERM-ignoring endpoint and a TERM-ignoring grandchild
+  of an exiting wrapper, each on timeout, shutdown, disable/enable + new reply and
+  barge-in + new reply: nothing survives, the next call never overlaps the old group and
+  still starts within timeout + grace + reap; an exit-0-on-TERM endpoint yielding
+  failure/cancellation, never accepted; an exit-0-on-TERM player on disable, barge-in and
+  timeout, never `played`; N > limit prequeued failing spans making exactly `limit` calls,
+  both transports; fault injection (EPERM on the old group, and a reap deadline exhausted
+  with the group present) on both transports: the next call never starts, queued spans are
+  refused, status shows HELD, enable stays held while the fault or the group persists,
+  clears on ESRCH, and speech resumes). These prove the endpoint/queue contract only, not TUI rendering.
+- **Known limitation, not fixed:** WAV synthesis is not run as a process group. Its 90 s
+  timeout and the new abort terminate the endpoint wrapper only; a descendant the wrapper
+  started can survive it, and SimpleSay does not bound that survivor.
+
+## 0.4.0 — 2026-09-07
+
+Direction attributes on the say tag (the speech-tag standard shared with claude-simplesay).
+
+- **`<say tone="…">`** passes the span's delivery to the endpoint as `SAY_INSTRUCTION`;
+  **`at="word: delivery"`** folds a mid-span shift into it. Endpoints that ignore the
+  variable speak the words unchanged.
+- **`<say pause="short|long|<s>"/>`** queues a beat of silence between spans, in playback
+  order, dropped by barge-in like any utterance.
+- Opening tags may be long and may arrive split across deltas; an unterminated `<say` is
+  held until its `>` lands.
+- A `<say>` inside backticks in prose is text about the tag, not a span.
+- Attribute-bearing tags are stripped from the transcript at `message_end` like bare ones.
+- Tests: tone/at through the endpoint, split opening tag, pause timing, backtick guard.
+
 ## 0.3.2 — 2026-08-30
 
 Resilience: a speech failure must never crash or spam the agent.

@@ -1,6 +1,6 @@
 import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, accessSync, constants } from "node:fs";
+import { unlink, realpathSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, accessSync, statSync, constants } from "node:fs";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -13,8 +13,52 @@ const execFileAsync = promisify(execFile);
 // stream: no tags; speak the reply paragraph by paragraph, skipping code/tables.
 type Mode = "tag" | "stream";
 
-const OPEN = "<say>";
 const CLOSE = "</say>";
+// The speech-tag standard (shared with claude-simplesay): the opening tag may carry direction
+// attributes, and a self-closing pause tag is a beat of silence between spans.
+//   <say tone="warm, unhurried">…</say>          tone  -> the span's delivery (SAY_INSTRUCTION)
+//   <say tone="even" at="but: firm, slower">…    at    -> a shift inside the span, folded into the instruction
+//   <say pause="short"/>  /  <say pause="long"/>   pause -> 0.35 s / 0.9 s / seconds of silence
+// A bare <say> is unchanged. Attributes never carry information the sentence lacks: the
+// endpoint is free to ignore SAY_INSTRUCTION, and the transcript reads correctly with tags gone.
+const OPEN_RE = /<say(\s[^<>]*?)?\s*(\/?)>/;
+const ATTR_RE = /(\w+)\s*=\s*"([^"]*)"/g;
+const TAG_ANY_RE = /<say(?:\s[^<>]*?)?\s*\/?>|<\/say>/g;
+const PAUSES: Record<string, number> = { short: 350, long: 900 };
+
+function parseAttrs(body: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of (body ?? "").matchAll(ATTR_RE)) out[m[1].toLowerCase()] = m[2];
+  return out;
+}
+
+// tone + at -> the instruction the endpoint receives. "at" is `word: delivery`, several split
+// by ";", folded as the model is trained to read it: "At the word 'w', delivery."
+function instructionFor(attrs: Record<string, string>): string {
+  const tone = (attrs.tone ?? "").trim();
+  const shifts = (attrs.at ?? "")
+    .split(";")
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => {
+      const i = p.indexOf(":");
+      if (i < 0) return "";
+      const w = p.slice(0, i).trim().replace(/^["']|["']$/g, "");
+      const d = p.slice(i + 1).trim().replace(/\.$/, "");
+      return w && d ? `At the word '${w}', ${d}.` : "";
+    })
+    .filter(Boolean);
+  if (!shifts.length) return tone;
+  return (tone ? tone.replace(/\.$/, "") + ". " : "") + shifts.join(" ");
+}
+
+function pauseMs(attrs: Record<string, string>): number {
+  const v = (attrs.pause ?? "").trim();
+  if (!v) return 0;
+  if (PAUSES[v] !== undefined) return PAUSES[v];
+  const n = Number(v.replace(/s$/, ""));
+  return Number.isFinite(n) && n > 0 ? Math.min(n * 1000, 10_000) : PAUSES.short;
+}
 
 // Wraps the editor so any keystroke interrupts current speech ("barge-in").
 // Composes with a previously-set custom editor (e.g. vim mode) if present:
@@ -46,6 +90,13 @@ class SimpleSayEditor extends CustomEditor {
   }
 }
 
+// Test seam: every process-group signal the extension sends goes through this. Production
+// never reassigns it (it calls process.kill at call time, exactly as before); the test
+// suite swaps it to inject EPERM or a teardown that never completes.
+export const __test = {
+  signal: (pid: number, sig: NodeJS.Signals | 0): boolean => process.kill(pid, sig),
+};
+
 export default function (pi: ExtensionAPI) {
   // Mode persists across sessions in a tiny JSON config, written only when
   // changed via /simplesay mode (SIMPLESAY_CONFIG relocates it — the test
@@ -53,7 +104,7 @@ export default function (pi: ExtensionAPI) {
   // file just falls back to the default: stream, so voice works with zero
   // agent config (tag mode needs the agent to emit <say> markers).
   const configFile = process.env.SIMPLESAY_CONFIG ?? join(homedir(), ".pi", "agent", "simplesay.json");
-  function loadConfig(): { mode: Mode; enabled: boolean } {
+  function loadConfig(): { mode: Mode; enabled: boolean; direct: boolean | undefined } {
     try {
       const c = JSON.parse(readFileSync(configFile, "utf8"));
       const m = c.mode;
@@ -61,14 +112,17 @@ export default function (pi: ExtensionAPI) {
         mode: m === "tag" || m === "stream" ? m : "stream",
         // Config written before `enabled` existed just lacks the key → on.
         enabled: c.enabled !== false,
+        // Absent key = never chosen; the default (WAV transport) applies.
+        direct: typeof c.direct === "boolean" ? c.direct : undefined,
       };
     } catch { /* no config yet — use the defaults */ }
-    return { mode: "stream", enabled: true };
+    return { mode: "stream", enabled: true, direct: undefined };
   }
   function saveConfig() {
     try {
       mkdirSync(dirname(configFile), { recursive: true });
-      writeFileSync(configFile, JSON.stringify({ mode, enabled }, null, 2) + "\n");
+      // `direct` rides along so saving mode/enabled never drops it (omitted while unset).
+      writeFileSync(configFile, JSON.stringify({ mode, enabled, direct: directSetting }, null, 2) + "\n");
     } catch (e) { dbg(`config save FAIL: ${e}`); }
   }
   const loaded = loadConfig();
@@ -76,6 +130,27 @@ export default function (pi: ExtensionAPI) {
   // Master switch: /simplesay disable mutes all speech until re-enabled.
   // Persists like mode, so a muted session stays muted across restarts.
   let enabled: boolean = loaded.enabled;
+
+  // Transport. "wav" (the default) is the synth-ahead pipeline: SAY_OUT=<tmp.wav>, then
+  // `--play <tmp.wav>`. "direct" is one plain `endpoint [--agent] "<text>"` call per span,
+  // in order, for endpoints that speak (or hand off) the text themselves and write no WAV —
+  // e.g. a sandboxed agent whose endpoint hands the text to a relay outside the sandbox, or
+  // a TTS server that plays on its own speakers. Explicit opt-in only:
+  // SIMPLESAY_DIRECT=1 selects it, SIMPLESAY_DIRECT=0 forces the WAV transport over a saved
+  // `direct: true`, unset defers to the saved setting (`/simplesay direct on|off`), else off.
+  // User-facing alias: `/simplesay output local|server` — local = WAV (played on this
+  // device), server = direct (the endpoint/server plays it). Same `direct` key, no new setting.
+  let directSetting: boolean | undefined = loaded.direct;
+  const directEnv = process.env.SIMPLESAY_DIRECT;
+  function transport(): { direct: boolean; source: "env" | "setting" | "default" } {
+    if (directEnv === "1") return { direct: true, source: "env" };
+    if (directEnv === "0") return { direct: false, source: "env" };
+    if (directSetting !== undefined) return { direct: directSetting, source: "setting" };
+    return { direct: false, source: "default" };
+  }
+  const transportLabel = () => { const t = transport(); return `${t.direct ? "direct" : "wav"} (${t.source})`; };
+  const outputLabel = () => { const t = transport(); return `${t.direct ? "server" : "local"} (${t.source})`; };
+  const envOverrideNote = () => (transport().source === "env" ? ` — SIMPLESAY_DIRECT=${directEnv} overrides the setting` : "");
   // Voice identity: explicit env wins; else derive the agent from the working
   // dir (~/Agents/<name>, the box convention) so each agent speaks as ITSELF
   // with zero per-agent config; "fabricant" only as a last resort. This
@@ -120,6 +195,7 @@ export default function (pi: ExtensionAPI) {
   // Per-message stream state.
   let acc = "";         // streamed text not yet parsed
   let speaking = false; // inside a <say> span (tag mode)
+  let direction = "";   // the open span's instruction (tag mode; from tone= / at=)
   let buf = "";         // text held for the next utterance
   let para = "";        // current paragraph (stream mode)
   let inFence = false;  // inside a ``` block (stream mode)
@@ -139,6 +215,13 @@ export default function (pi: ExtensionAPI) {
   let epoch = 0;
   let muted = false;
   let currentPlayChild: ChildProcess | null = null;
+  // Set while a direct call is in flight: cancels it (group kill) and records its outcome
+  // at once; the next call still waits at the teardown barrier (see killGroup).
+  let currentDirectCancel: (() => void) | null = null;
+  // Aborted by stopSpeaking so an in-flight synth wrapper is terminated on barge-in /
+  // disable / shutdown instead of running out its 90 s timeout. The synth is NOT a process
+  // group: neither this abort nor the timeout reaches descendants the wrapper started.
+  let abortCtl = new AbortController();
 
   // Debug tracing: one line per pipeline decision, so a silent session shows
   // exactly where speech died (no events? muted? synth fail? play fail?).
@@ -149,26 +232,118 @@ export default function (pi: ExtensionAPI) {
     if (!DEBUG) return;
     try { appendFileSync(DEBUG, `${new Date().toISOString()} [${process.pid}] ${msg}\n`); } catch { /* never break speech over logging */ }
   }
-  dbg(`loaded mode=${mode} enabled=${enabled} agent=${agentName} endpoint=${endpoint}`);
+  dbg(`loaded mode=${mode} enabled=${enabled} output=${outputLabel()} transport=${transportLabel()} agent=${agentName} endpoint=${endpoint}`);
+  if (directEnv !== undefined && directEnv !== "0" && directEnv !== "1") dbg(`SIMPLESAY_DIRECT='${directEnv}' ignored (use 1 or 0)`);
+
+  // A failed span is logged, never printed: console.* from inside a running TUI writes
+  // straight over the frame. Failures go to the debug log and count toward the
+  // circuit-breaker; a tripped breaker is visible in bare /simplesay status.
+  function spanFailed(what: string, e: unknown) {
+    synthFails++;
+    dbg(`span FAIL (${what}) via ${endpoint} (${synthFails}/${SYNTH_FAIL_LIMIT}): ${e}`);
+    if (synthFails >= SYNTH_FAIL_LIMIT && endpointUsable) {
+      endpointUsable = false;
+      dbg(`circuit-breaker: endpoint failed ${SYNTH_FAIL_LIMIT}x; voice paused for this session — fix the endpoint and /simplesay enable to retry`);
+    }
+  }
 
   // The exact commands speech will run, shown when an endpoint is connected
   // (and in bare-status output) so a silent session can be debugged by running
   // the same command by hand. Evaluated at call time — follows /simplesay changes.
-  const speakCmdPreview = () =>
-    `SAY_OUT=<tmp.wav> ${endpoint}${agentFlag ? ` --agent ${agentName}` : ""} "<text>"  ->  ${endpoint} --play <tmp.wav>`;
+  const speakCmdPreview = () => {
+    const call = `${endpoint}${agentFlag ? ` --agent ${agentName}` : ""} "<text>"`;
+    return transport().direct
+      ? `env -u SAY_OUT ${call}  (direct: one call per span, no --play; rc 0 = accepted, not proof of playback)`
+      : `SAY_OUT=<tmp.wav> ${call}  ->  ${endpoint} --play <tmp.wav>`;
+  };
 
   function stopSpeaking() {
     epoch++;
     muted = true;
     dbg(`barge-in: muted=true epoch=${epoch}`);
+    abortCtl.abort();
+    abortCtl = new AbortController();
+    if (currentDirectCancel) currentDirectCancel(); // kills its group and settles the span
     if (currentPlayChild?.pid) {
-      try { process.kill(-currentPlayChild.pid, "SIGTERM"); } catch { /* already exited */ }
+      killGroup(currentPlayChild.pid, "barge-in");
       currentPlayChild = null;
     }
   }
 
+  // Bounded termination of a child's whole process group: SIGTERM now, SIGKILL after a
+  // short grace (SIMPLESAY_KILL_GRACE_MS, default 1 s) to whatever is still in the group —
+  // a TERM-ignoring endpoint, or a TERM-ignoring descendant left behind by a wrapper that
+  // did exit. The KILL goes to the group, so it lands even after the leader is gone.
+  //
+  // Teardown is also a queue BARRIER. A span's outcome (cancelled / timed out) is recorded
+  // the moment it is terminated, but the next direct call or --play must not start while
+  // the old group still exists — that would overlap two endpoint calls. Every teardown
+  // joins `teardownBarrier`, which is global: it holds across cancellation,
+  // disable/enable and the next reply.
+  //
+  // The barrier FAILS CLOSED. Only ESRCH proves a group is gone. Any other signal error
+  // (EPERM, …) or a group still present at grace + SIMPLESAY_REAP_MS (default 500 ms)
+  // is an UNCONFIRMED teardown: the pgid is recorded in `heldGroups`, which refuses every
+  // further endpoint execution (queued spans settle as refused, new spans are refused at
+  // once) until `/simplesay enable` re-probes and every held group returns ESRCH. The
+  // barrier promise itself still resolves on time, so Pi's promise chains never hang.
+  type Probe = "gone" | "present" | "unknown";
+  const errCode = (e: unknown) => (e as NodeJS.ErrnoException)?.code ?? String(e);
+  function signalGroup(pid: number, sig: NodeJS.Signals | 0): { r: Probe; code?: string } {
+    try { __test.signal(-pid, sig); return { r: "present" }; }
+    catch (e) { const code = errCode(e); return { r: code === "ESRCH" ? "gone" : "unknown", code }; }
+  }
+  const heldGroups = new Map<number, string>(); // pgid -> why its teardown is unconfirmed
+  function holdTeardown(pid: number, reason: string) {
+    heldGroups.set(pid, reason);
+    dbg(`teardown FAILED (unconfirmed): group -${pid}: ${reason} — speech HELD; /simplesay enable re-probes`);
+  }
+  const heldSummary = () => [...heldGroups].map(([g, why]) => `-${g} (${why})`).join(", ");
+  let teardownBarrier: Promise<void> = Promise.resolve();
+  function killGroup(pid: number | undefined, why: string): Promise<void> {
+    if (!pid) return Promise.resolve();
+    const term = signalGroup(pid, "SIGTERM");
+    if (term.r === "gone") return Promise.resolve();
+    if (term.r === "unknown") { holdTeardown(pid, `SIGTERM failed: ${term.code} (${why})`); return Promise.resolve(); }
+    const graceMs = Number(process.env.SIMPLESAY_KILL_GRACE_MS) || 1000;
+    const reapMs = Number(process.env.SIMPLESAY_REAP_MS) || 500;
+    const t0 = Date.now();
+    const done = new Promise<void>((resolve) => {
+      let killed = false;
+      const tick = () => {
+        const probe = signalGroup(pid, 0);
+        if (probe.r === "gone") { dbg(`teardown: group -${pid} gone after ${Date.now() - t0}ms (${why})`); resolve(); return; }
+        if (probe.r === "unknown") { holdTeardown(pid, `probe failed: ${probe.code} (${why})`); resolve(); return; }
+        const elapsed = Date.now() - t0;
+        if (!killed && elapsed >= graceMs) {
+          killed = true;
+          const k = signalGroup(pid, "SIGKILL");
+          if (k.r === "unknown") { holdTeardown(pid, `SIGKILL failed: ${k.code} (${why})`); resolve(); return; }
+          if (k.r === "present") dbg(`${why}: group -${pid} survived SIGTERM ${graceMs}ms; sent SIGKILL`);
+        }
+        if (elapsed >= graceMs + reapMs) {
+          holdTeardown(pid, `still present ${elapsed}ms after SIGTERM, past grace + reap (${why})`);
+          resolve();
+          return;
+        }
+        setTimeout(tick, 20);
+      };
+      tick();
+    });
+    teardownBarrier = Promise.all([teardownBarrier, done]).then(() => undefined);
+    return done;
+  }
+  // Wait until every teardown started so far — including any started while waiting — is done.
+  async function awaitTeardown(): Promise<void> {
+    for (;;) {
+      const b = teardownBarrier;
+      await b;
+      if (b === teardownBarrier) return;
+    }
+  }
+
   function reset() {
-    acc = buf = para = "";
+    acc = buf = para = direction = "";
     speaking = inFence = sawText = false;
     muted = false;
     dbg(`reset: muted=false`);
@@ -178,7 +353,7 @@ export default function (pi: ExtensionAPI) {
   function clean(t: string): string {
     return t
       .replace(/```[\s\S]*?```/g, " ").replace(/~~~[\s\S]*?~~~/g, " ") // code blocks
-      .split(OPEN).join("").split(CLOSE).join("")                      // say tags
+      .replace(TAG_ANY_RE, "")                                         // say tags, with or without attributes
       .replace(/^\s*\|.*\|\s*$/gm, " ")                                // table rows
       .replace(/\$\$?([^$]*[\\^_][^$]*)\$\$?/g, " $1 ")                // unwrap $…$ math; leaves $5 currency
       .replace(/[A-Z]:\\[\w\\.-]+/g, " ")                               // Windows paths (before backslash removal)
@@ -224,15 +399,18 @@ export default function (pi: ExtensionAPI) {
   // absent device — accepts the file then never exits) would otherwise play
   // forever after pi quits. The timer kills the whole process group (negative
   // pid, like stopSpeaking). Override via SIMPLESAY_PLAY_TIMEOUT_MS.
-  function playWav(wav: string, myEpoch: number): Promise<void> {
+  async function playWav(wav: string, myEpoch: number): Promise<void> {
+    await awaitTeardown(); // never start a player while a killed one's group still exists
     return new Promise((resolve) => {
       if (myEpoch !== epoch) { resolve(); return; }
+      if (heldGroups.size) { dbg(`play REFUSED (teardown unconfirmed: ${heldSummary()}): ${wav}`); resolve(); return; }
       const playTimeoutMs = Number(process.env.SIMPLESAY_PLAY_TIMEOUT_MS) || 120_000;
       const child = spawn(endpoint, ["--play", wav], { detached: true, stdio: "ignore" });
       child.unref();
       currentPlayChild = child;
       let killTimer: NodeJS.Timeout | undefined;
       let done = false;
+      let timedOut = false;
       const finish = () => {
         if (done) return;
         done = true;
@@ -240,33 +418,117 @@ export default function (pi: ExtensionAPI) {
         if (currentPlayChild === child) currentPlayChild = null;
         resolve();
       };
+      // Termination reason beats the exit code: a player that exits 0 on SIGTERM after a
+      // timeout or a cancellation (barge-in / disable / shutdown bump the epoch) did not play.
       child.on("exit", (code, signal) => {
-        if (signal !== "SIGTERM" && code !== 0 && code !== null) console.error("[simplesay]", `player exited code=${code} signal=${signal}`);
+        if (timedOut) dbg(`play FAIL: timed out after ${playTimeoutMs}ms (exit code=${code} signal=${signal})`);
+        else if (myEpoch !== epoch) dbg(`receipt: cancelled (play) ${wav}`);
+        else if (code === 0) dbg(`receipt: played ${wav}`);
+        else dbg(`play FAIL: player exited code=${code} signal=${signal}`);
         finish();
       });
       child.on("error", (err) => {
-        console.error("[simplesay]", err);
+        dbg(`play FAIL: ${err}`);
         finish();
       });
       killTimer = setTimeout(() => {
         if (currentPlayChild === child && child.pid) {
           dbg(`play TIMEOUT (${playTimeoutMs}ms): killing group -${child.pid}`);
-          try { process.kill(-child.pid, "SIGTERM"); } catch { /* already exited */ }
+          timedOut = true;
+          killGroup(child.pid, "play timeout");
         }
       }, playTimeoutMs);
     });
   }
 
-  function speak(raw: string) {
+  // A beat of silence between spans, in playback order, dropped by barge-in like any utterance.
+  function queuePause(ms: number) {
+    if (!enabled || muted || ms <= 0) return;
+    const myEpoch = epoch;
+    dbg(`pause: ${ms}ms`);
+    playChain = playChain.then(() => (myEpoch === epoch ? new Promise<void>((r) => setTimeout(r, ms)) : undefined));
+  }
+
+  // Direct transport: one ordered call per span, no SAY_OUT, no WAV, no --play. Spawned
+  // as its own session leader like playWav and bounded by SIMPLESAY_DIRECT_TIMEOUT_MS
+  // (default 120 s, since a local direct endpoint may play before it exits).
+  // Settlement is deterministic: a timeout or a cancellation (barge-in / disable /
+  // shutdown) group-kills the call (TERM, then KILL after the grace) and records the
+  // outcome immediately. The termination reason wins over any later exit code: timeout =
+  // failure (counts toward the breaker), cancellation = cancelled; neither is success and
+  // neither resets the breaker. The NEXT call still waits at the teardown barrier until
+  // the old group is gone (bounded by grace + reap margin), so calls never overlap.
+  // rc 0 means the endpoint ACCEPTED the text — for a relay endpoint, accepted by the
+  // relay's queue, never proof it was audibly played — so the receipt says "accepted".
+  async function runDirect(args: string[], dirEnv: Record<string, string>, myEpoch: number, text: string): Promise<void> {
+    await awaitTeardown(); // the previous call's group must be gone before this one starts
+    return new Promise((resolve) => {
+      if (myEpoch !== epoch) { dbg(`direct DROPPED (cancelled before dispatch): "${text.slice(0, 60)}"`); resolve(); return; }
+      if (heldGroups.size) { dbg(`direct REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`); resolve(); return; }
+      if (!enabled || !endpointUsable) { dbg(`direct DROPPED (${enabled ? "endpoint unusable" : "disabled"})`); resolve(); return; }
+      const env: NodeJS.ProcessEnv = { ...process.env, ...dirEnv };
+      // Removed, not just not-added: an inherited SAY_OUT would tell a WAV-capable endpoint
+      // to write a file that nothing will ever play.
+      delete env.SAY_OUT;
+      const timeoutMs = Number(process.env.SIMPLESAY_DIRECT_TIMEOUT_MS) || 120_000;
+      let child: ChildProcess;
+      try {
+        child = spawn(endpoint, args, { detached: true, stdio: "ignore", env });
+      } catch (e) { spanFailed("direct", e); resolve(); return; }
+      child.unref();
+      currentPlayChild = child;
+      let done = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      type Outcome = { kind: "accepted" } | { kind: "failed"; why: string } | { kind: "cancelled" };
+      const settle = (o: Outcome) => {
+        if (done) return; // first outcome wins; a later exit (even rc 0) changes nothing
+        done = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (currentPlayChild === child) currentPlayChild = null;
+        if (currentDirectCancel === cancel) currentDirectCancel = null;
+        if (o.kind === "accepted") { synthFails = 0; dbg(`receipt: accepted (direct) "${text.slice(0, 60)}"`); }
+        else if (o.kind === "cancelled") dbg(`direct cancelled (barge-in/disable/shutdown) — receipt: cancelled "${text.slice(0, 60)}"`);
+        else spanFailed("direct", o.why);
+        resolve();
+      };
+      const cancel = () => { killGroup(child.pid, "direct cancel"); settle({ kind: "cancelled" }); };
+      currentDirectCancel = cancel;
+      child.on("exit", (code, signal) =>
+        settle(code === 0 ? { kind: "accepted" } : { kind: "failed", why: `exit code=${code} signal=${signal}` }));
+      child.on("error", (err) => settle({ kind: "failed", why: String(err) }));
+      killTimer = setTimeout(() => {
+        dbg(`direct TIMEOUT (${timeoutMs}ms): killing group -${child.pid}`);
+        killGroup(child.pid, "direct timeout");
+        settle({ kind: "failed", why: `timed out after ${timeoutMs}ms` });
+      }, timeoutMs);
+    });
+  }
+
+  function speak(raw: string, dir = "") {
     if (!enabled) { dbg(`speak DROPPED (disabled): ${raw.length}ch`); return; } // /simplesay disable — silence everything
     if (muted) { dbg(`speak DROPPED (muted): ${raw.length}ch`); return; } // interrupted mid-message; drop the rest silently
+    if (heldGroups.size) { dbg(`speak REFUSED (teardown unconfirmed: ${heldSummary()}): ${raw.length}ch`); return; } // fail closed
     if (!endpointUsable) { dbg(`speak DROPPED (endpoint unusable)`); return; } // preflight/circuit-breaker tripped — already warned once, stay quiet
     const text = clean(raw);
     if (!text || !endpoint) { dbg(`speak DROPPED (empty after clean): raw=${raw.length}ch`); return; }
-    dbg(`speak: "${text.slice(0, 60)}"`);
+    dbg(`speak: "${text.slice(0, 60)}"${dir ? ` [${dir}]` : ""}`);
     const myEpoch = epoch;
+    // Direction rides as SAY_INSTRUCTION, the documented env contract; an
+    // endpoint that does not know it simply speaks the words.
+    const dirEnv = dir ? { SAY_INSTRUCTION: dir } : {};
     const args = agentFlag ? ["--agent", agentName, text] : [text];
+
+    // Direct transport: queue on the playback chain itself, so spans dispatch strictly one
+    // at a time in order (no synth-ahead), after anything already queued in either transport.
+    if (transport().direct) {
+      playChain = playChain
+        .then(() => runDirect(args, dirEnv, myEpoch, text))
+        .catch((e) => dbg(`direct chain error: ${e}`));
+      return;
+    }
+
     const wav = `/tmp/simplesay-${process.pid}-${seq++}.wav`;
+    const signal = abortCtl.signal;
 
     // Synthesize to a WAV ahead of playback (SAY_OUT skips the endpoint's play step).
     // `timeout` is load-bearing: if the endpoint hangs (wedged TTS server —
@@ -277,21 +539,26 @@ export default function (pi: ExtensionAPI) {
     const synth = (synthChain = synthChain
       .then(() => {
         if (myEpoch !== epoch) return false; // stopped before synth started
-        return execFileAsync(endpoint, args, { env: { ...process.env, SAY_OUT: wav }, timeout: 90_000 })
-          .then(() => { synthFails = 0; return true; }); // a success clears the circuit-breaker
+        // Breaker tripped while this span waited in the queue: don't invoke the endpoint.
+        if (!endpointUsable) { dbg(`synth DROPPED (endpoint unusable): "${text.slice(0, 60)}"`); return false; }
+        if (heldGroups.size) { dbg(`synth REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`); return false; }
+        return execFileAsync(endpoint, args, { env: { ...process.env, ...dirEnv, SAY_OUT: wav }, timeout: 90_000, signal })
+          .then(() => {
+            // rc 0 is not proof of audio: success needs a regular, non-empty WAV. An
+            // endpoint that ignores SAY_OUT (spools or plays the text itself) fails
+            // here instead of reaching --play; such endpoints belong on the direct transport.
+            const st = statSync(wav, { throwIfNoEntry: false });
+            if (!st || !st.isFile() || st.size === 0)
+              throw new Error(`endpoint exited 0 but ${!st ? "wrote no" : !st.isFile() ? "wrote a non-regular" : "wrote an empty"} output file (SAY_OUT=${wav})`);
+            synthFails = 0; // a success clears the circuit-breaker
+            return true;
+          });
       })
       .catch((e) => {
-        dbg(`synth FAIL: ${e}`);
-        synthFails++;
-        // Degrade, don't spam: warn up to the limit, then pause voice for the
-        // session (circuit-breaker) so a wedged/misconfigured endpoint can't
-        // print a "Command failed" wall on every utterance and read as a crash.
-        if (synthFails <= SYNTH_FAIL_LIMIT)
-          console.warn(`[simplesay] speech failed via ${endpoint} (${synthFails}/${SYNTH_FAIL_LIMIT}) — is the TTS endpoint reachable?`);
-        if (synthFails >= SYNTH_FAIL_LIMIT) {
-          endpointUsable = false;
-          console.warn(`[simplesay] endpoint failed ${SYNTH_FAIL_LIMIT}×; voice paused for this session — fix the endpoint and /simplesay enable to retry`);
-        }
+        // Degrade, don't spam: log and count toward the circuit-breaker, which pauses
+        // voice for the session at the limit. Never console.* — see spanFailed.
+        if (myEpoch !== epoch) dbg(`synth cancelled (barge-in/disable/shutdown): ${e}`);
+        else spanFailed("synth", e);
         return false;
       }));
 
@@ -299,18 +566,28 @@ export default function (pi: ExtensionAPI) {
     playChain = playChain
       .then(() => synth)
       .then((ok) => ((ok && myEpoch === epoch) ? playWav(wav, myEpoch) : undefined))
-      .catch((e) => console.error("[simplesay]", e))
+      .catch((e) => dbg(`play chain error: ${e}`))
       .finally(() => unlink(wav, () => {}));
   }
 
-  // tag mode: speak each <say>…</say> span as one utterance once it closes.
+  // tag mode: speak each <say …>…</say> span as one utterance once it closes; a self-closing
+  // <say pause="…"/> queues silence. An opening tag may be long (attributes) and may arrive
+  // split across deltas, so an unterminated "<say" is held until its ">" lands.
   function parseTags(final: boolean) {
-    const tail = Math.max(OPEN.length, CLOSE.length) - 1; // hold for a split marker
+    const tail = CLOSE.length - 1; // hold for a split closer
     for (;;) {
       if (!speaking) {
-        const i = acc.indexOf(OPEN);
-        if (i < 0) { acc = final ? "" : acc.slice(-tail); return; }
-        acc = acc.slice(i + OPEN.length);
+        const i = acc.search(/<say\b/);
+        if (i < 0) { acc = final ? "" : acc.slice(-3); return; }
+        // A tag in backticks is prose about the tag, not a span (an agent discussing the
+        // feature will write "only `<say>` spans are heard").
+        if (i > 0 && acc[i - 1] === "`") { acc = acc.slice(i + 4); continue; }
+        const m = OPEN_RE.exec(acc.slice(i));
+        if (!m) { if (final) { acc = ""; return; } acc = acc.slice(i); return; } // "<say …" without its ">" yet
+        const attrs = parseAttrs(m[1]);
+        acc = acc.slice(i + m[0].length);
+        if (m[2] === "/") { queuePause(pauseMs(attrs)); continue; }   // <say pause="long"/>
+        direction = instructionFor(attrs);
         speaking = true;
       } else {
         const j = acc.indexOf(CLOSE);
@@ -318,14 +595,15 @@ export default function (pi: ExtensionAPI) {
           const safe = final ? acc.length : Math.max(0, acc.length - tail);
           buf += acc.slice(0, safe);
           acc = acc.slice(safe);
-          if (final && buf.trim()) { speak(buf); buf = ""; speaking = false; }
+          if (final && buf.trim()) { speak(buf, direction); buf = ""; speaking = false; direction = ""; }
           return;
         }
         buf += acc.slice(0, j);
         acc = acc.slice(j + CLOSE.length);
-        if (buf.trim()) speak(buf);
+        if (buf.trim()) speak(buf, direction);
         buf = "";
         speaking = false;
+        direction = "";
       }
     }
   }
@@ -438,14 +716,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("simplesay", {
-    description: "SimpleSay voice: /simplesay (status) | /simplesay enable|disable | /simplesay mode <tag|stream> | /simplesay <agent> <endpoint> [--no-agent]",
+    description: "SimpleSay voice: /simplesay (status) | /simplesay enable|disable | /simplesay mode <tag|stream> | /simplesay output [local|server] | /simplesay direct <on|off> | /simplesay <agent> <endpoint> [--no-agent]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
 
       // Bare command: report current state instead of erroring.
       if (parts.length === 0) {
         ctx.ui.notify(
-          `SimpleSay: ${enabled ? "enabled" : "DISABLED"}, mode=${mode}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}, config=${configFile}`,
+          `SimpleSay: ${enabled ? "enabled" : "DISABLED"}, mode=${mode}, output=${outputLabel()}, transport=${transportLabel()}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}${endpointUsable ? "" : " (voice PAUSED: endpoint failing, see debug log; /simplesay enable retries)"}${heldGroups.size ? ` (speech HELD: teardown unconfirmed for group ${heldSummary()}; /simplesay enable re-probes)` : ""}, config=${configFile}`,
           "info",
         );
         ctx.ui.notify(`Speak runs: ${speakCmdPreview()}`, "info");
@@ -464,11 +742,67 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Where the voice plays, in user terms: local = the WAV transport (this device plays
+      // it), server = the direct transport (the endpoint/server plays it; nothing returns).
+      // An alias over the same saved `direct` setting; SIMPLESAY_DIRECT still overrides it.
+      if (parts[0] === "output") {
+        const v = parts[1];
+        if (v === undefined) {
+          const t = transport();
+          ctx.ui.notify(
+            `SimpleSay output: ${outputLabel()} — ${t.direct ? "the endpoint/server plays the audio; nothing comes back" : "audio is played on this device"}${envOverrideNote()}`,
+            "info",
+          );
+          return;
+        }
+        if (v !== "local" && v !== "server") {
+          ctx.ui.notify(`Usage: /simplesay output [local|server]  (now: output=${outputLabel()})`, "error");
+          return;
+        }
+        directSetting = v === "server";
+        saveConfig();
+        ctx.ui.notify(`SimpleSay output: ${v} (saved); in effect: output=${outputLabel()}${envOverrideNote()}`, "info");
+        return;
+      }
+
+      // Transport switch. Saved like mode; SIMPLESAY_DIRECT (1/0) still overrides it.
+      if (parts[0] === "direct") {
+        const v = parts[1];
+        if (v !== "on" && v !== "off") {
+          ctx.ui.notify(`Usage: /simplesay direct <on|off>  (now: transport=${transportLabel()})`, "error");
+          return;
+        }
+        directSetting = v === "on";
+        saveConfig();
+        const t = transport();
+        ctx.ui.notify(
+          `SimpleSay direct transport: ${v} (saved); in effect: transport=${transportLabel()}${t.source === "env" ? " — SIMPLESAY_DIRECT overrides the setting" : ""}`,
+          "info",
+        );
+        return;
+      }
+
       // Master switch, on aliases included so /simplesay on/off do the
       // obvious thing too. Toggling back on re-arms immediately — the next
       // assistant message speaks normally.
       if (parts[0] === "enable" || parts[0] === "on" || parts[0] === "disable" || parts[0] === "off") {
-        enabled = parts[0] === "enable" || parts[0] === "on";
+        const turningOn = parts[0] === "enable" || parts[0] === "on";
+        // A held (unconfirmed) teardown is cleared only by proof: re-probe every recorded
+        // group; each must now return ESRCH. Anything else keeps speech held.
+        if (turningOn && heldGroups.size) {
+          for (const g of [...heldGroups.keys()]) {
+            const probe = signalGroup(g, 0);
+            if (probe.r === "gone") { heldGroups.delete(g); dbg(`teardown confirmed on re-probe: group -${g} gone (ESRCH)`); }
+            else heldGroups.set(g, probe.r === "present" ? "still exists on re-probe" : `re-probe failed: ${probe.code}`);
+          }
+          if (heldGroups.size) {
+            dbg(`enable refused: teardown still unconfirmed: ${heldSummary()}`);
+            ctx.ui.notify(`SimpleSay still HELD: teardown unconfirmed for group ${heldSummary()}. Speech stays off until that group is gone; retry /simplesay enable.`, "error");
+            return;
+          }
+          ctx.ui.notify("SimpleSay: previously unconfirmed teardown now confirmed (group gone); speech released", "info");
+        }
+        enabled = turningOn;
         if (enabled) { synthFails = 0; endpointUsable = checkEndpoint(); } // re-arm the circuit-breaker + re-preflight
         saveConfig(); // persists across sessions
         if (!enabled) stopSpeaking(); // cut off anything playing/queued right now
@@ -477,7 +811,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (parts.length < 2) {
-        ctx.ui.notify("Usage: /simplesay [enable|disable | mode <tag|stream> | <agent> <endpoint> [--no-agent]]", "error");
+        ctx.ui.notify("Usage: /simplesay [enable|disable | mode <tag|stream> | output [local|server] | direct <on|off> | <agent> <endpoint> [--no-agent]]", "error");
         return;
       }
       const [a, ep] = parts;
@@ -534,12 +868,12 @@ export default function (pi: ExtensionAPI) {
 
     // Strip <say> tags from the displayed message (keep the inner text).
     const tagged = msg.content.some(
-      (c: any) => c.type === "text" && (c.text.includes(OPEN) || c.text.includes(CLOSE)),
+      (c: any) => c.type === "text" && /<say(?:\s[^<>]*?)?\s*\/?>|<\/say>/.test(c.text),
     );
     if (!tagged) return;
     const content = msg.content.map((c: any) =>
       c.type === "text"
-        ? { ...c, text: c.text.split(OPEN).join("").split(CLOSE).join("").replace(/[ \t]{2,}/g, " ") }
+        ? { ...c, text: c.text.replace(TAG_ANY_RE, "").replace(/[ \t]{2,}/g, " ") }
         : c,
     );
     return { message: { ...msg, content } };
