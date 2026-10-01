@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.0 — 2026-10-01
+
+Circuit breaker retries automatically.
+
+- **Half-open auto-retry for the circuit breaker.** A RUNTIME trip (SYNTH_FAIL_LIMIT
+  consecutive synth/direct failures) no longer pauses voice for the rest of the session.
+  Once `retryMs` has elapsed since the trip (default 60 s), the next span to arrive is let
+  through as a single half-open probe. Success closes the breaker outright — `synthFails`
+  resets and voice resumes — and logs `circuit-breaker: endpoint recovered`. Failure
+  re-opens it with the cooldown doubled, capped at 15 minutes by default. This is checked
+  lazily, only when a span actually arrives; no timer runs on its own and nothing keeps the
+  process alive. Applies to both transports (WAV and direct), since both funnel through the
+  same breaker.
+- **`SIMPLESAY_RETRY_MS`** sets the initial cooldown in ms (default `60000`); `0` disables
+  auto-retry entirely (the pre-0.6.0 behaviour — only `/simplesay enable` reopens it).
+  **`SIMPLESAY_RETRY_MAX_MS`** caps the doubling (default `900000`, 15 min).
+- **A config error never auto-retries.** A missing or non-executable endpoint (the
+  preflight check) is a config problem, not a transient one — fixing a typo in
+  `SIMPLESAY_ENDPOINT` is the only way back, so it stays paused no matter how long the
+  process runs, same as before. Only a RUNTIME failure (a present endpoint that fails to
+  synthesize or exits non-zero) is eligible for auto-retry.
+- **Only one probe in flight.** While a half-open probe is outstanding, every other span is
+  dropped — same as a fully open breaker — rather than queued for later; a span that
+  arrives during the open period is lost, not replayed once the breaker recovers.
+- **`/simplesay enable` still force-closes immediately**, bypassing any cooldown, and is a
+  full close rather than a single-shot probe (every span right after it speaks, not just
+  the first). The trip message now says voice is paused and will retry automatically in
+  N seconds, or that `/simplesay enable` retries right away. Bare `/simplesay` shows the
+  breaker state while open, e.g. `(voice PAUSED: breaker open, retry in 42s; /simplesay
+  enable retries now)`.
+- **A granted probe can never wedge the breaker open.** Every path that can abandon a
+  half-open probe without a verdict — an empty-after-clean span (now checked before the
+  probe is even granted), barge-in/disable/shutdown cancelling it before or during
+  dispatch, a refused-by-teardown guard, a direct call settling as `cancelled` — explicitly
+  releases it (`breaker stays open, next span may probe again`, no backoff, not counted as
+  a failure) instead of leaving `probing` stuck true. Each probe also carries its own token,
+  so a stale one can never close or re-trip a breaker a newer probe has since moved past. As
+  a backstop for anything not explicitly covered, a probe that's been outstanding longer
+  than any legitimate synth/direct call could take is declared lost and the next span is
+  granted a new probe in its place.
+
 ## 0.5.0 — 2026-10-01
 
 A declared **direct transport** for endpoints that cannot write a WAV, WAV success that

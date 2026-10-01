@@ -119,7 +119,8 @@ To try it ad hoc without installing: `pi -e /path/to/pi-simplesay/src/index.ts`
   it and `SIMPLESAY_DEBUG=0` disables it. A silent session shows exactly where
   speech died. Span failures are written **only** here, never to the terminal via
   `console.*` (which would draw over the TUI); a tripped circuit-breaker shows as
-  `voice PAUSED` in bare `/simplesay` status.
+  `voice PAUSED` in bare `/simplesay` status, with a retry countdown once it's a
+  runtime trip (see **Circuit breaker & auto-retry** below).
 - **Display rewrite (tag mode only):** `message_end` returns a replacement message
   (`MessageEndEventResult.message`) with the tags removed. `message_update` is
   live-only and can't be rewritten, so raw tags are visible for the instant they
@@ -258,7 +259,8 @@ SIGTERM still gets a failure (timeout) or a cancellation, never `accepted`, and 
 resets the circuit-breaker. In both transports the breaker is also checked when a span is
 dispatched, so spans already queued when it trips never reach the endpoint. The WAV
 player follows the same rule: a player that exits 0 after a timeout or a cancellation is
-logged as failed or `cancelled`, never `played`.
+logged as failed or `cancelled`, never `played`. See **Circuit breaker & auto-retry** below
+for what happens once the breaker trips.
 
 **Receipts are honest.** Exit 0 from a direct endpoint is logged as `receipt: accepted
 (direct)`, never `played`: SimpleSay cannot see audio it did not play. For a relay
@@ -269,6 +271,50 @@ endpoint (for example, a sandboxed agent handing text to a relay outside its san
 does not recall it: a remotely queued job can only be dropped if the relay itself
 supports that. Likewise `<say pause="…"/>` is a local timer between dispatches; it does
 not produce an audible gap in a remote queue that plays spans back to back.
+
+## Circuit breaker & auto-retry
+
+After `SIMPLESAY_FAIL_LIMIT` (default 3) consecutive synth/direct failures, the breaker
+trips and voice goes quiet — logged, never printed, so a TUI session doesn't fill with
+errors. What happens next depends on *why* it tripped:
+
+- **A config error** (the endpoint is missing or not executable, caught by preflight at
+  startup) stays paused until something actually changes it: fix `SIMPLESAY_ENDPOINT` (or
+  its permissions), then run `/simplesay enable`. Nothing is retried automatically — there
+  is nothing a timer could do about a wrong path.
+- **A runtime failure** (the endpoint exists but synthesis fails or the call exits
+  non-zero — an unreachable TTS server, a VPN that's down) is treated as transient and
+  **auto-retries**. After `SIMPLESAY_RETRY_MS` (default 60 s) has passed since the trip,
+  the *next* span to arrive is let through as a single half-open probe:
+  - **Succeeds** → the breaker closes outright, the failure count resets, and voice
+    resumes from there on (logged as `circuit-breaker: endpoint recovered`).
+  - **Fails** → the breaker re-opens with the cooldown doubled, up to
+    `SIMPLESAY_RETRY_MAX_MS` (default 15 min).
+
+  This check is lazy: it only runs when a span actually arrives, so there is no timer and
+  nothing keeps the process alive on its own. Only **one** probe is ever in flight — any
+  other span that shows up while the breaker is open (cooling down, or already probing) is
+  dropped, not queued for later; a span that arrives during the open period is lost, the
+  same as today, it just isn't open forever. Both transports share one breaker, so a
+  runtime trip on either the WAV path or the direct path auto-retries the same way.
+
+  **A probe can never wedge the breaker open.** Every way a probe can be abandoned without
+  a verdict — barge-in or `/simplesay disable` cancelling it mid-dispatch, a teardown still
+  unconfirmed, a direct call settling as cancelled — explicitly releases it (the breaker
+  stays open with the same cooldown; the very next span may probe again at once, and this
+  isn't counted as a failure). As a backstop against anything not explicitly covered, a
+  probe outstanding longer than any legitimate synth or direct call could take is declared
+  lost and handed to the next span instead.
+
+```bash
+export SIMPLESAY_RETRY_MS=60000       # optional, initial cooldown in ms (default 60s); 0 disables auto-retry
+export SIMPLESAY_RETRY_MAX_MS=900000  # optional, cap on the doubling backoff in ms (default 15min)
+```
+
+`/simplesay enable` always force-closes the breaker immediately, regardless of the
+cooldown — it's a full close, not a single probe, so every span right after it speaks, not
+just the first. Bare `/simplesay` shows the breaker's state whenever it isn't fully closed,
+e.g. `(voice PAUSED: breaker open, retry in 42s; /simplesay enable retries now)`.
 
 ## Example: a Kokoro-based endpoint
 SimpleSay ships no TTS engine by design. It just shells out to whatever endpoint you

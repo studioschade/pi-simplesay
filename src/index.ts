@@ -95,6 +95,9 @@ class SimpleSayEditor extends CustomEditor {
 // suite swaps it to inject EPERM or a teardown that never completes.
 export const __test = {
   signal: (pid: number, sig: NodeJS.Signals | 0): boolean => process.kill(pid, sig),
+  // Clock seam for the circuit-breaker's cooldown math. Production never reassigns it;
+  // the test suite swaps it to fast-forward past a cooldown without a real sleep.
+  now: (): number => Date.now(),
 };
 
 export default function (pi: ExtensionAPI) {
@@ -177,10 +180,14 @@ export default function (pi: ExtensionAPI) {
   // A TTS extension must NEVER crash or spam the agent because speech failed.
   // Preflight the endpoint once: if it is missing or not executable, disable
   // voice for the session with ONE clear warning instead of erroring on every
-  // utterance. A present-but-failing endpoint (an unreachable TTS server, a
-  // wrong host — the 2026-08-30 "kokoro on core, not halo" crash) is caught at
-  // runtime by the synth circuit-breaker below, which pauses after a few tries.
-  let endpointUsable = true;
+  // utterance. This is a CONFIG error (wrong path, bad permissions) and never
+  // auto-retries on its own — nothing short of a fixed path makes a missing binary
+  // start existing. A present-but-failing endpoint (an unreachable TTS server, a
+  // wrong host — the 2026-08-30 "kokoro on core, not halo" crash) is a RUNTIME
+  // failure instead, caught by the synth/direct circuit-breaker below — that one
+  // DOES auto-retry, since what it's waiting on (a server, a network path) can come
+  // back on its own.
+  let preflightFailed = false;
   function checkEndpoint(): boolean {
     try { accessSync(endpoint, constants.X_OK); return true; }
     catch {
@@ -188,9 +195,55 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
   }
-  endpointUsable = checkEndpoint();
+  preflightFailed = !checkEndpoint();
   let synthFails = 0;                                                  // consecutive synth failures
   const SYNTH_FAIL_LIMIT = Number(process.env.SIMPLESAY_FAIL_LIMIT) || 3;
+
+  // --- Auto-recovery (half-open circuit breaker) — RUNTIME trips only ------------
+  // Once SYNTH_FAIL_LIMIT consecutive synth/direct failures trip the breaker, voice
+  // no longer stays paused forever: after `retryMs` has elapsed since the trip, the
+  // NEXT span to arrive is let through as a single probe (half-open). Success closes
+  // the breaker (synthFails resets, voice resumes); failure re-opens it with the
+  // cooldown doubled, capped at RETRY_MS_MAX. This is evaluated lazily, only when a
+  // span actually arrives — no timer and nothing keeps the process alive on its own.
+  // SIMPLESAY_RETRY_MS=0 disables auto-retry entirely (the pre-0.6.0 behaviour: only
+  // /simplesay enable reopens it).
+  function parseMsEnv(name: string, def: number): number {
+    const v = process.env[name];
+    if (v === undefined) return def;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : def;
+  }
+  const RETRY_MS_INITIAL = parseMsEnv("SIMPLESAY_RETRY_MS", 60_000);
+  // Math.max guards a misconfigured cap smaller than the initial value — the cap can
+  // never be below where backoff starts, or doubling would shrink the cooldown.
+  const RETRY_MS_MAX = Math.max(RETRY_MS_INITIAL, parseMsEnv("SIMPLESAY_RETRY_MAX_MS", 15 * 60_000));
+  let breakerOpenedAt: number | null = null; // __test.now() at the trip; null = closed
+  let retryMs = RETRY_MS_INITIAL;            // current cooldown; doubles on each failed probe
+  let probing = false;                       // a half-open probe is in flight — at most one
+  // Identifies WHICH probe is currently valid. Bumped every time tryBreaker() grants a new
+  // probe; every dispatch path that was handed a probe carries ITS token (`myProbe` in
+  // speak()) and only that token may close/re-trip the breaker or clear `probing` for it.
+  // Without this, a stale probe reclaimed by the deadline backstop below could still land
+  // late (its synth/direct call finally settling) and stomp on whatever probe replaced it.
+  let probeToken = 0;
+  let probeStartedAt: number | null = null; // __test.now() when probeToken was granted
+
+  // Backstop for a granted probe that never reaches spanSucceeded()/spanFailed() through
+  // any path we explicitly release (releaseProbe, below) — an unanticipated throw or drop
+  // between the grant and dispatch would otherwise wedge the breaker open "probe in
+  // flight" forever, the exact failure auto-retry exists to remove. The deadline is the
+  // longest a legitimate probe could still be outstanding: a synth call (90 s, see the
+  // execFileAsync timeout in speak()) or a direct call (SIMPLESAY_DIRECT_TIMEOUT_MS),
+  // whichever is larger, plus the teardown grace + reap margin a cancelled/timed-out call
+  // waits out, plus headroom.
+  const PROBE_SYNTH_TIMEOUT_MS = 90_000; // mirrors the execFileAsync timeout in speak()
+  const PROBE_DIRECT_TIMEOUT_MS = Number(process.env.SIMPLESAY_DIRECT_TIMEOUT_MS) || 120_000;
+  const PROBE_PLAY_TIMEOUT_MS = Number(process.env.SIMPLESAY_PLAY_TIMEOUT_MS) || 120_000;
+  const PROBE_TEARDOWN_MARGIN_MS =
+    (Number(process.env.SIMPLESAY_KILL_GRACE_MS) || 1000) + (Number(process.env.SIMPLESAY_REAP_MS) || 500);
+  const PROBE_DEADLINE_MS =
+    Math.max(PROBE_SYNTH_TIMEOUT_MS, PROBE_DIRECT_TIMEOUT_MS, PROBE_PLAY_TIMEOUT_MS) + PROBE_TEARDOWN_MARGIN_MS + 10_000;
 
   // Per-message stream state.
   let acc = "";         // streamed text not yet parsed
@@ -235,15 +288,114 @@ export default function (pi: ExtensionAPI) {
   dbg(`loaded mode=${mode} enabled=${enabled} output=${outputLabel()} transport=${transportLabel()} agent=${agentName} endpoint=${endpoint}`);
   if (directEnv !== undefined && directEnv !== "0" && directEnv !== "1") dbg(`SIMPLESAY_DIRECT='${directEnv}' ignored (use 1 or 0)`);
 
+  // True iff a span may be dispatched right now: preflight passed, and either the
+  // breaker is closed (any span) or `myProbe` names the CURRENTLY valid half-open probe
+  // (null never matches while open — see tryBreaker). Read-only — safe to call again for
+  // the SAME span as it moves through a queue (the synth chain, the direct chain) without
+  // changing the decision already made for it.
+  function usableFor(myProbe: number | null): boolean {
+    if (preflightFailed) return false;
+    if (breakerOpenedAt === null) return true; // closed: nothing to gate
+    return probing && myProbe !== null && myProbe === probeToken;
+  }
+
+  // The single decision point per span: called once, synchronously, before anything is
+  // queued (speak()'s top-level gate, shared by both transports). Grants exactly one
+  // probe once the cooldown has elapsed; every other span — while fully open, or while
+  // a probe is already outstanding — is refused. On a successful grant, `probeToken` is
+  // bumped and `probing`/`probeStartedAt` reflect the new probe; the caller reads
+  // `probeToken` right after (see `myProbe` in speak()) to get its own token.
+  function tryBreaker(): boolean {
+    if (preflightFailed) return false;
+    if (breakerOpenedAt === null) return true; // closed: normal operation
+    if (probing) {
+      // Backstop: a probe that never reached spanSucceeded/spanFailed/releaseProbe (an
+      // unanticipated throw or drop between the grant and dispatch) would otherwise wedge
+      // the breaker "probe in flight" forever — exactly the failure auto-retry exists to
+      // remove. Past PROBE_DEADLINE_MS it can't still be a legitimate in-flight call, so
+      // declare it lost and let THIS span take over as the new probe.
+      if (probeStartedAt !== null && __test.now() - probeStartedAt > PROBE_DEADLINE_MS) {
+        dbg(`circuit-breaker: probe #${probeToken} never settled within ${PROBE_DEADLINE_MS}ms — treating it as lost, granting a new probe`);
+        probing = false;
+        probeStartedAt = null;
+      } else {
+        return false; // one probe at a time
+      }
+    }
+    if (retryMs <= 0) return false; // SIMPLESAY_RETRY_MS=0: auto-retry off
+    if (__test.now() - breakerOpenedAt < retryMs) return false; // still cooling down
+    probing = true;
+    probeToken += 1;
+    probeStartedAt = __test.now();
+    dbg(`circuit-breaker: cooldown elapsed (${retryMs}ms) — probing with this span (#${probeToken})`);
+    return true;
+  }
+
+  // Status-line fragment for why voice might be paused. A preflight failure is a
+  // config error and never auto-retries; a runtime trip (breaker open) shows the
+  // retry countdown, e.g. "breaker open, retry in 42s".
+  function breakerStatusNote(): string {
+    if (preflightFailed) return " (voice PAUSED: endpoint not usable — fix SIMPLESAY_ENDPOINT, then /simplesay enable)";
+    if (breakerOpenedAt === null) return "";
+    if (probing) return " (breaker open, probing now)";
+    if (retryMs <= 0) return " (voice PAUSED: endpoint failing, see debug log; /simplesay enable retries)";
+    const remaining = Math.max(0, Math.ceil((retryMs - (__test.now() - breakerOpenedAt)) / 1000));
+    return ` (voice PAUSED: breaker open, retry in ${remaining}s; /simplesay enable retries now)`;
+  }
+
+  // Called on every path where a granted probe is abandoned WITHOUT a verdict — cancelled
+  // before dispatch, refused by an unrelated guard (held teardown), barge-in/disable mid
+  // synth, etc. The breaker stays OPEN with the SAME retryMs/breakerOpenedAt (unchanged),
+  // so the cooldown has already elapsed and the very next span may probe again at once —
+  // it just isn't treated as a failure (no doubling) since the endpoint was never actually
+  // asked anything. A no-op unless `myProbe` is still the CURRENT probe: a stale/reclaimed
+  // token (see tryBreaker's deadline backstop) must never touch a probe that replaced it.
+  function releaseProbe(myProbe: number | null, reason: string) {
+    if (!probing || myProbe === null || myProbe !== probeToken) return;
+    probing = false;
+    probeStartedAt = null;
+    dbg(`circuit-breaker: probe #${myProbe} ${reason} before it could settle — breaker stays open, next span may probe again`);
+  }
+
+  // A success clears the circuit-breaker; if `myProbe` is still the current half-open
+  // probe, it CLOSES the breaker outright (not just resets the counter) and voice resumes
+  // from here on. A stale/reclaimed token (see tryBreaker) is ignored for that part — only
+  // `synthFails` still resets, same as any ordinary success.
+  function spanSucceeded(myProbe: number | null = null) {
+    if (probing && myProbe !== null && myProbe === probeToken) {
+      probing = false;
+      probeStartedAt = null;
+      breakerOpenedAt = null;
+      retryMs = RETRY_MS_INITIAL;
+      dbg(`circuit-breaker: endpoint recovered (probe #${myProbe})`);
+    }
+    synthFails = 0;
+  }
+
   // A failed span is logged, never printed: console.* from inside a running TUI writes
   // straight over the frame. Failures go to the debug log and count toward the
   // circuit-breaker; a tripped breaker is visible in bare /simplesay status.
-  function spanFailed(what: string, e: unknown) {
+  function spanFailed(what: string, e: unknown, myProbe: number | null = null) {
+    if (probing && myProbe !== null && myProbe === probeToken) {
+      // The probe itself failed: re-open at once with the cooldown doubled (capped) —
+      // no need to re-accumulate SYNTH_FAIL_LIMIT consecutive failures a second time.
+      probing = false;
+      probeStartedAt = null;
+      breakerOpenedAt = __test.now();
+      retryMs = Math.min(retryMs * 2, RETRY_MS_MAX);
+      dbg(`circuit-breaker: probe #${myProbe} failed (${what}) via ${endpoint}: ${e} — re-opened, retry in ${Math.round(retryMs / 1000)}s`);
+      return;
+    }
     synthFails++;
     dbg(`span FAIL (${what}) via ${endpoint} (${synthFails}/${SYNTH_FAIL_LIMIT}): ${e}`);
-    if (synthFails >= SYNTH_FAIL_LIMIT && endpointUsable) {
-      endpointUsable = false;
-      dbg(`circuit-breaker: endpoint failed ${SYNTH_FAIL_LIMIT}x; voice paused for this session — fix the endpoint and /simplesay enable to retry`);
+    if (synthFails >= SYNTH_FAIL_LIMIT && breakerOpenedAt === null) {
+      breakerOpenedAt = __test.now();
+      retryMs = RETRY_MS_INITIAL;
+      dbg(
+        retryMs > 0
+          ? `circuit-breaker: endpoint failed ${SYNTH_FAIL_LIMIT}x; voice paused for this session — will retry automatically in ${Math.round(retryMs / 1000)}s (or /simplesay enable now)`
+          : `circuit-breaker: endpoint failed ${SYNTH_FAIL_LIMIT}x; voice paused for this session — fix the endpoint and /simplesay enable to retry`,
+      );
     }
   }
 
@@ -460,12 +612,33 @@ export default function (pi: ExtensionAPI) {
   // the old group is gone (bounded by grace + reap margin), so calls never overlap.
   // rc 0 means the endpoint ACCEPTED the text — for a relay endpoint, accepted by the
   // relay's queue, never proof it was audibly played — so the receipt says "accepted".
-  async function runDirect(args: string[], dirEnv: Record<string, string>, myEpoch: number, text: string): Promise<void> {
+  async function runDirect(
+    args: string[],
+    dirEnv: Record<string, string>,
+    myEpoch: number,
+    text: string,
+    myProbe: number | null,
+  ): Promise<void> {
     await awaitTeardown(); // the previous call's group must be gone before this one starts
     return new Promise((resolve) => {
-      if (myEpoch !== epoch) { dbg(`direct DROPPED (cancelled before dispatch): "${text.slice(0, 60)}"`); resolve(); return; }
-      if (heldGroups.size) { dbg(`direct REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`); resolve(); return; }
-      if (!enabled || !endpointUsable) { dbg(`direct DROPPED (${enabled ? "endpoint unusable" : "disabled"})`); resolve(); return; }
+      if (myEpoch !== epoch) {
+        releaseProbe(myProbe, "cancelled before dispatch");
+        dbg(`direct DROPPED (cancelled before dispatch): "${text.slice(0, 60)}"`);
+        resolve();
+        return;
+      }
+      if (heldGroups.size) {
+        releaseProbe(myProbe, "refused (teardown unconfirmed) before dispatch");
+        dbg(`direct REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`);
+        resolve();
+        return;
+      }
+      if (!enabled || !usableFor(myProbe)) {
+        releaseProbe(myProbe, enabled ? "found unusable" : "disabled before dispatch");
+        dbg(`direct DROPPED (${enabled ? "endpoint unusable" : "disabled"})`);
+        resolve();
+        return;
+      }
       const env: NodeJS.ProcessEnv = { ...process.env, ...dirEnv };
       // Removed, not just not-added: an inherited SAY_OUT would tell a WAV-capable endpoint
       // to write a file that nothing will ever play.
@@ -474,7 +647,7 @@ export default function (pi: ExtensionAPI) {
       let child: ChildProcess;
       try {
         child = spawn(endpoint, args, { detached: true, stdio: "ignore", env });
-      } catch (e) { spanFailed("direct", e); resolve(); return; }
+      } catch (e) { spanFailed("direct", e, myProbe); resolve(); return; }
       child.unref();
       currentPlayChild = child;
       let done = false;
@@ -486,9 +659,12 @@ export default function (pi: ExtensionAPI) {
         if (killTimer) clearTimeout(killTimer);
         if (currentPlayChild === child) currentPlayChild = null;
         if (currentDirectCancel === cancel) currentDirectCancel = null;
-        if (o.kind === "accepted") { synthFails = 0; dbg(`receipt: accepted (direct) "${text.slice(0, 60)}"`); }
-        else if (o.kind === "cancelled") dbg(`direct cancelled (barge-in/disable/shutdown) — receipt: cancelled "${text.slice(0, 60)}"`);
-        else spanFailed("direct", o.why);
+        if (o.kind === "accepted") { spanSucceeded(myProbe); dbg(`receipt: accepted (direct) "${text.slice(0, 60)}"`); }
+        else if (o.kind === "cancelled") {
+          releaseProbe(myProbe, "cancelled");
+          dbg(`direct cancelled (barge-in/disable/shutdown) — receipt: cancelled "${text.slice(0, 60)}"`);
+        }
+        else spanFailed("direct", o.why, myProbe);
         resolve();
       };
       const cancel = () => { killGroup(child.pid, "direct cancel"); settle({ kind: "cancelled" }); };
@@ -508,9 +684,23 @@ export default function (pi: ExtensionAPI) {
     if (!enabled) { dbg(`speak DROPPED (disabled): ${raw.length}ch`); return; } // /simplesay disable — silence everything
     if (muted) { dbg(`speak DROPPED (muted): ${raw.length}ch`); return; } // interrupted mid-message; drop the rest silently
     if (heldGroups.size) { dbg(`speak REFUSED (teardown unconfirmed: ${heldSummary()}): ${raw.length}ch`); return; } // fail closed
-    if (!endpointUsable) { dbg(`speak DROPPED (endpoint unusable)`); return; } // preflight/circuit-breaker tripped — already warned once, stay quiet
+    // Clean BEFORE the breaker gate: an empty-after-clean span (whitespace, a bare tag)
+    // must never consume a probe grant — it was never going to reach the endpoint anyway.
     const text = clean(raw);
     if (!text || !endpoint) { dbg(`speak DROPPED (empty after clean): raw=${raw.length}ch`); return; }
+    // The one decision point per span: closed -> always true; open -> true only for the
+    // single span granted as the half-open probe (see tryBreaker/usableFor above).
+    if (!tryBreaker()) {
+      const why = preflightFailed ? "preflight failed" : probing ? "probe in flight" : "breaker open";
+      dbg(`speak DROPPED (${why})`);
+      return;
+    }
+    // Captured once, synchronously, right after a successful grant: null when the breaker
+    // is closed (no probe involved), else the token identifying THIS span as the probe.
+    // Threaded through to every place that can settle or abandon it (usableFor/
+    // releaseProbe/spanSucceeded/spanFailed), so a stale/reclaimed probe can never close
+    // or re-trip a breaker that has since moved on to a different one.
+    const myProbe = probing ? probeToken : null;
     dbg(`speak: "${text.slice(0, 60)}"${dir ? ` [${dir}]` : ""}`);
     const myEpoch = epoch;
     // Direction rides as SAY_INSTRUCTION, the documented env contract; an
@@ -522,8 +712,8 @@ export default function (pi: ExtensionAPI) {
     // at a time in order (no synth-ahead), after anything already queued in either transport.
     if (transport().direct) {
       playChain = playChain
-        .then(() => runDirect(args, dirEnv, myEpoch, text))
-        .catch((e) => dbg(`direct chain error: ${e}`));
+        .then(() => runDirect(args, dirEnv, myEpoch, text, myProbe))
+        .catch((e) => { dbg(`direct chain error: ${e}`); releaseProbe(myProbe, "direct chain error"); });
       return;
     }
 
@@ -538,10 +728,14 @@ export default function (pi: ExtensionAPI) {
     // surfaces an error to .catch, which logs and lets the queue move on.
     const synth = (synthChain = synthChain
       .then(() => {
-        if (myEpoch !== epoch) return false; // stopped before synth started
+        if (myEpoch !== epoch) { releaseProbe(myProbe, "cancelled before synth started"); return false; }
         // Breaker tripped while this span waited in the queue: don't invoke the endpoint.
-        if (!endpointUsable) { dbg(`synth DROPPED (endpoint unusable): "${text.slice(0, 60)}"`); return false; }
-        if (heldGroups.size) { dbg(`synth REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`); return false; }
+        if (!usableFor(myProbe)) { dbg(`synth DROPPED (endpoint unusable): "${text.slice(0, 60)}"`); return false; }
+        if (heldGroups.size) {
+          releaseProbe(myProbe, "refused (teardown unconfirmed) before synth started");
+          dbg(`synth REFUSED (teardown unconfirmed: ${heldSummary()}): "${text.slice(0, 60)}"`);
+          return false;
+        }
         return execFileAsync(endpoint, args, { env: { ...process.env, ...dirEnv, SAY_OUT: wav }, timeout: 90_000, signal })
           .then(() => {
             // rc 0 is not proof of audio: success needs a regular, non-empty WAV. An
@@ -550,15 +744,15 @@ export default function (pi: ExtensionAPI) {
             const st = statSync(wav, { throwIfNoEntry: false });
             if (!st || !st.isFile() || st.size === 0)
               throw new Error(`endpoint exited 0 but ${!st ? "wrote no" : !st.isFile() ? "wrote a non-regular" : "wrote an empty"} output file (SAY_OUT=${wav})`);
-            synthFails = 0; // a success clears the circuit-breaker
+            spanSucceeded(myProbe); // a success clears the circuit-breaker (closes it if this was the probe)
             return true;
           });
       })
       .catch((e) => {
         // Degrade, don't spam: log and count toward the circuit-breaker, which pauses
         // voice for the session at the limit. Never console.* — see spanFailed.
-        if (myEpoch !== epoch) dbg(`synth cancelled (barge-in/disable/shutdown): ${e}`);
-        else spanFailed("synth", e);
+        if (myEpoch !== epoch) { dbg(`synth cancelled (barge-in/disable/shutdown): ${e}`); releaseProbe(myProbe, "cancelled (synth aborted)"); }
+        else spanFailed("synth", e, myProbe);
         return false;
       }));
 
@@ -723,7 +917,7 @@ export default function (pi: ExtensionAPI) {
       // Bare command: report current state instead of erroring.
       if (parts.length === 0) {
         ctx.ui.notify(
-          `SimpleSay: ${enabled ? "enabled" : "DISABLED"}, mode=${mode}, output=${outputLabel()}, transport=${transportLabel()}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}${endpointUsable ? "" : " (voice PAUSED: endpoint failing, see debug log; /simplesay enable retries)"}${heldGroups.size ? ` (speech HELD: teardown unconfirmed for group ${heldSummary()}; /simplesay enable re-probes)` : ""}, config=${configFile}`,
+          `SimpleSay: ${enabled ? "enabled" : "DISABLED"}, mode=${mode}, output=${outputLabel()}, transport=${transportLabel()}, agent='${agentName}', endpoint='${endpoint}'${agentFlag ? "" : " (no --agent)"}${breakerStatusNote()}${heldGroups.size ? ` (speech HELD: teardown unconfirmed for group ${heldSummary()}; /simplesay enable re-probes)` : ""}, config=${configFile}`,
           "info",
         );
         ctx.ui.notify(`Speak runs: ${speakCmdPreview()}`, "info");
@@ -803,7 +997,16 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("SimpleSay: previously unconfirmed teardown now confirmed (group gone); speech released", "info");
         }
         enabled = turningOn;
-        if (enabled) { synthFails = 0; endpointUsable = checkEndpoint(); } // re-arm the circuit-breaker + re-preflight
+        if (enabled) {
+          // Force-close the breaker right now, regardless of cooldown — /simplesay
+          // enable is always an immediate retry, by spec — and re-run preflight in
+          // case the endpoint path itself was the thing that got fixed.
+          synthFails = 0;
+          probing = false;
+          breakerOpenedAt = null;
+          retryMs = RETRY_MS_INITIAL;
+          preflightFailed = !checkEndpoint();
+        }
         saveConfig(); // persists across sessions
         if (!enabled) stopSpeaking(); // cut off anything playing/queued right now
         ctx.ui.notify(`SimpleSay ${enabled ? "enabled" : "disabled"} (saved)`, "info");

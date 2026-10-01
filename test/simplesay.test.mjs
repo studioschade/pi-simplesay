@@ -889,6 +889,420 @@ exit 0
   t0.cleanup();
 }
 
+// --- circuit-breaker auto-retry (half-open), 0.6.0 ---
+// Fault injection through the extension's clock seam (__test.now), so cooldowns are
+// crossed by moving a virtual clock instead of sleeping real seconds. "Boom*" spans
+// fail (ignore SAY_OUT / nonzero exit); anything else succeeds.
+const retryWavScript = `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then echo "PLAY|$2" >> "$log"; exit 0; fi
+[ "$1" = "--agent" ] && shift 2
+text="$*"
+echo "SYNTH|$text" >> "$log"
+case "$text" in
+  Boom*) : ;;
+  *) printf 'wav' > "$SAY_OUT" ;;
+esac
+exit 0
+`;
+const alwaysFailWavScript = `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then echo "PLAY|$2" >> "$log"; exit 0; fi
+[ "$1" = "--agent" ] && shift 2
+echo "SYNTH|$*" >> "$log"
+exit 0
+`; // exits 0 but never writes SAY_OUT -> every call fails
+const retryDirectScript = `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+[ "$1" = "--agent" ] && shift 2
+text="$*"
+echo "START|$text" >> "$log"
+case "$text" in
+  Boom*) exit 7 ;;
+  *) exit 0 ;;
+esac
+`;
+
+{
+  // Trip -> drop within cooldown -> probe after cooldown succeeds -> recovered -> normal after.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-ok.log`);
+  let vt = 10_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    check('retry: 3 failures trip the breaker', (read(dbgFile).match(/circuit-breaker: endpoint failed 3x/g) ?? []).length === 1, read(dbgFile));
+    const beforeCount = lines(read(t.log), 'SYNTH').length;
+    await tagReply(t, '<say>Still cooling down.</say>');
+    await wait(200);
+    check('retry: a span inside the cooldown is dropped, no endpoint call', lines(read(t.log), 'SYNTH').length === beforeCount, read(t.log));
+    check('retry: dropped-in-cooldown span logs breaker open', /speak DROPPED \(breaker open\)/.test(read(dbgFile)), read(dbgFile));
+    const status = await statusOf(t);
+    check('retry: status shows the breaker open with a retry countdown', /voice PAUSED: breaker open, retry in \d+s/.test(status), status);
+    vt += 5001; // past the 5s cooldown
+    await tagReply(t, '<say>Recovered span.</say>');
+    await wait(400);
+    const log = read(t.log);
+    check('retry: the probe after cooldown reaches the endpoint', lines(log, 'SYNTH').some((l) => l.includes('Recovered span.')), log);
+    check('retry: a successful probe closes the breaker', /circuit-breaker: endpoint recovered/.test(read(dbgFile)), read(dbgFile));
+    const status2 = await statusOf(t);
+    check('retry: status shows no breaker note once recovered', !/breaker|PAUSED/.test(status2), status2);
+    await tagReply(t, '<say>Back to normal.</say>');
+    await wait(400);
+    check('retry: speech resumes normally after recovery', lines(read(t.log), 'SYNTH').some((l) => l.includes('Back to normal.')), read(t.log));
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // Probe fails -> backoff doubles, capped at SIMPLESAY_RETRY_MAX_MS.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-backoff.log`);
+  let vt = 20_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '1000', SIMPLESAY_RETRY_MAX_MS: '4000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: alwaysFailWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Fail one.</say><say>Fail two.</say><say>Fail three.</say>');
+    await wait(400);
+    check('backoff: initial trip', (read(dbgFile).match(/circuit-breaker: endpoint failed 3x/g) ?? []).length === 1, read(dbgFile));
+    const expectedSeconds = [2, 4, 4]; // 1s -> doubled to 2s -> 4s -> capped at 4s
+    for (const _ of expectedSeconds) {
+      vt += 10_000; // comfortably past whatever the current cooldown is (<= 4000ms)
+      await tagReply(t, '<say>Probe attempt.</say>');
+      await wait(300);
+    }
+    const dbgLog = read(dbgFile);
+    const reopens = [...dbgLog.matchAll(/re-opened, retry in (\d+)s/g)].map((m) => Number(m[1]));
+    check('backoff: cooldown doubles then caps at RETRY_MS_MAX', JSON.stringify(reopens) === JSON.stringify(expectedSeconds), JSON.stringify(reopens));
+    check('backoff: never recovers (every probe also fails)', !/endpoint recovered/.test(dbgLog), dbgLog);
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // SIMPLESAY_RETRY_MS=0 disables auto-retry: old behaviour, only a manual
+  // /simplesay enable reopens it, no matter how much time passes.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-disabled.log`);
+  let vt = 30_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '0', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    check('RETRY_MS=0: trips as before', (read(dbgFile).match(/circuit-breaker: endpoint failed 3x/g) ?? []).length === 1, read(dbgFile));
+    check('RETRY_MS=0: trip message keeps the old wording (no auto-retry promised)', /fix the endpoint and \/simplesay enable to retry/.test(read(dbgFile)), read(dbgFile));
+    vt += 10_000_000_000; // an enormous amount of "time"; must make no difference
+    await tagReply(t, '<say>Would-be probe.</say>');
+    await wait(300);
+    check('RETRY_MS=0: never probes no matter how much time passes', !lines(read(t.log), 'SYNTH').some((l) => l.includes('Would-be probe.')), read(t.log));
+    const status = await statusOf(t);
+    check('RETRY_MS=0: status shows the old PAUSED wording, no countdown', /voice PAUSED: endpoint failing, see debug log; \/simplesay enable retries/.test(status), status);
+    await t.commands.simplesay.handler('enable', t.ctx);
+    await tagReply(t, '<say>Works after manual enable.</say>');
+    await wait(300);
+    check('RETRY_MS=0: /simplesay enable still force-closes it', lines(read(t.log), 'SYNTH').some((l) => l.includes('Works after manual enable.')), read(t.log));
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // A preflightFailed endpoint (missing/not executable: a config error) must never
+  // auto-retry, no matter how much virtual time passes -- only a real fix + a manual
+  // /simplesay enable can bring it back.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-simplesay-preflight-'));
+  const ep = path.join(dir, 'missing.sh');
+  const dbgFile = path.join(dir, 'dbg.log');
+  const saved = {
+    SIMPLESAY_ENDPOINT: process.env.SIMPLESAY_ENDPOINT,
+    SIMPLESAY_CONFIG: process.env.SIMPLESAY_CONFIG,
+    SIMPLESAY_DEBUG: process.env.SIMPLESAY_DEBUG,
+    SIMPLESAY_RETRY_MS: process.env.SIMPLESAY_RETRY_MS,
+  };
+  process.env.SIMPLESAY_ENDPOINT = ep;
+  process.env.SIMPLESAY_CONFIG = path.join(dir, 'simplesay.json');
+  process.env.SIMPLESAY_DEBUG = dbgFile;
+  process.env.SIMPLESAY_RETRY_MS = '100'; // short: if the bug existed, it would show fast
+  const origWarn = console.warn;
+  console.warn = () => {};
+  let vt = 1000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  try {
+    const h = harness(ep, '');
+    ext(h.pi);
+    h.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+    h.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Never spoken, the endpoint is missing.' } });
+    await h.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Never spoken, the endpoint is missing.' }] } });
+    await wait(200);
+    vt += 10_000_000; // lots of virtual time passes
+    h.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+    h.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Still never spoken.' } });
+    await h.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Still never spoken.' }] } });
+    await wait(200);
+    const dbgLog = read(dbgFile);
+    check('preflight-unusable: never probes, no matter how much time passes', (dbgLog.match(/speak DROPPED \(preflight failed\)/g) ?? []).length === 2, dbgLog);
+    check('preflight-unusable: never logs a circuit-breaker probe/recovery line', !/circuit-breaker/.test(dbgLog), dbgLog);
+    // Fix the endpoint for real, then enable: this is a config fix, not a timed recovery.
+    fs.writeFileSync(ep, '#!/usr/bin/env bash\n[ "$1" = "--play" ] && exit 0\nprintf \'wav\' > "$SAY_OUT"\n');
+    fs.chmodSync(ep, 0o755);
+    await h.commands.simplesay.handler('enable', h.ctx);
+    h.handlers.message_update({ assistantMessageEvent: { type: 'start' } });
+    h.handlers.message_update({ assistantMessageEvent: { type: 'text_delta', delta: 'Works once fixed and enabled.' } });
+    await h.handlers.message_end({ message: { role: 'assistant', content: [{ type: 'text', text: 'Works once fixed and enabled.' }] } });
+    await wait(300);
+    const dbgLog2 = read(dbgFile);
+    check('preflight-unusable: a real fix + enable makes it speak again', /speak: "Works once fixed and enabled\./.test(dbgLog2), dbgLog2);
+  } finally {
+    __test.now = realNow;
+    console.warn = origWarn;
+    for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+{
+  // /simplesay enable force-closes the breaker immediately, bypassing the cooldown
+  // entirely -- and it's a full close, not a single-shot half-open probe: every span
+  // right after it speaks, not just the first.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-manual-enable.log`);
+  let vt = 40_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '60000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    check('manual enable: breaker is open, well inside the 60s cooldown', /voice PAUSED: breaker open/.test(await statusOf(t)), await statusOf(t));
+    await t.commands.simplesay.handler('enable', t.ctx);
+    await tagReply(t, '<say>First after enable.</say><say>Second after enable.</say>');
+    await wait(400);
+    const log = read(t.log);
+    check('manual enable: force-closes immediately, bypassing the cooldown', lines(log, 'SYNTH').some((l) => l.includes('First after enable.')), log);
+    check('manual enable: not limited to a single probe -- both spans speak', lines(log, 'SYNTH').some((l) => l.includes('Second after enable.')), log);
+    check('manual enable: status shows no breaker note', !/breaker|PAUSED/.test(await statusOf(t)), await statusOf(t));
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // Only one probe in flight at a time: two spans land in the SAME message once the
+  // cooldown has elapsed (both speak() calls run synchronously in the same tag-parse
+  // pass) -- only the first may become the probe, the second is dropped, not queued.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-single-probe.log`);
+  let vt = 50_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    vt += 5001;
+    await tagReply(t, '<say>Probe span.</say><say>Second span while probe pending.</say>');
+    await wait(400);
+    const log = read(t.log), dbgLog = read(dbgFile);
+    const postTripSynths = lines(log, 'SYNTH').filter((l) => !l.includes('Boom'));
+    check('single probe: exactly one endpoint call while a probe is outstanding',
+      postTripSynths.length === 1 && postTripSynths[0].includes('Probe span.'), log);
+    check('single probe: the second span is dropped as "probe in flight", not queued', /speak DROPPED \(probe in flight\)/.test(dbgLog), dbgLog);
+    check('single probe: the probe succeeded and recovered the breaker', /circuit-breaker: endpoint recovered/.test(dbgLog), dbgLog);
+    await tagReply(t, '<say>After recovery.</say>');
+    await wait(400);
+    check('single probe: speech resumes normally after recovery', lines(read(t.log), 'SYNTH').some((l) => l.includes('After recovery.')), read(t.log));
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // Auto-retry applies to the direct transport too, via the same breaker.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-direct.log`);
+  let vt = 60_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_DIRECT: '1', SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryDirectScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    check('direct retry: 3 failures trip the breaker', (read(dbgFile).match(/circuit-breaker: endpoint failed 3x/g) ?? []).length === 1, read(dbgFile));
+    vt += 5001;
+    await tagReply(t, '<say>Recovered direct span.</say>');
+    await wait(400);
+    const log = read(t.log), dbgLog = read(dbgFile);
+    check('direct retry: the probe reaches the endpoint and recovers',
+      lines(log, 'START').some((l) => l.includes('Recovered direct span.')) && /circuit-breaker: endpoint recovered/.test(dbgLog),
+      `${log} | ${dbgLog}`);
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+// --- probe-lifecycle robustness (review round: a granted probe must never wedge) ---
+{
+  // Probe granted, then barge-in cancels it before it can settle -> the breaker must not
+  // wedge open waiting on a "probe in flight" that will never resolve; the very next span
+  // may probe again immediately: no fresh cooldown wait, no backoff, not a failure.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-probe-cancel.log`);
+  let vt = 70_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const slowProbeScript = `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then echo "PLAY|$2" >> "$log"; exit 0; fi
+[ "$1" = "--agent" ] && shift 2
+text="$*"
+echo "SYNTH-START|$text" >> "$log"
+case "$text" in
+  Boom*) : ;;
+  Slow*) sleep 2; printf 'wav' > "$SAY_OUT" ;;
+  *) printf 'wav' > "$SAY_OUT" ;;
+esac
+echo "SYNTH-END|$text" >> "$log"
+`;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: slowProbeScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    const editor = bargeInEditor(t);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    vt += 5001;
+    await tagReply(t, '<say>Slow probe span.</say>');
+    await waitFor(() => /SYNTH-START\|Slow probe span\./.test(read(t.log)), 1500);
+    await wait(100);
+    editor.handleInput('x'); // barge-in: cancels the in-flight probe before it settles
+    await wait(300);
+    const dbgLog = read(dbgFile), log = read(t.log);
+    check('probe cancel: the in-flight probe never completes', !/SYNTH-END\|Slow probe span\./.test(log), log);
+    check('probe cancel: releases the probe instead of wedging it',
+      /probe #\d+ cancelled \(synth aborted\) before it could settle/.test(dbgLog), dbgLog);
+    check('probe cancel: not counted as a failure (no backoff, no premature recovery)',
+      !/circuit-breaker: probe #\d+ failed/.test(dbgLog) && !/endpoint recovered/.test(dbgLog), dbgLog);
+    // The next span may probe again immediately -- no further cooldown wait needed.
+    await tagReply(t, '<say>Next probe succeeds.</say>');
+    await wait(400);
+    check('probe cancel: the very next span can probe again at once',
+      lines(read(t.log), 'SYNTH-START').some((l) => l.includes('Next probe succeeds.')), read(t.log));
+    check('probe cancel: and it recovers the breaker', /circuit-breaker: endpoint recovered/.test(read(dbgFile)), read(dbgFile));
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // An empty-after-clean span (clean() strips a bare URL to nothing) must never consume
+  // the half-open probe grant -- it was never going to reach the endpoint, so the next
+  // real span must still be free to become the probe.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-empty-span.log`);
+  let vt = 80_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: retryWavScript });
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    vt += 5001;
+    await tagReply(t, '<say>https://example.com/only-a-url</say><say>Real probe span.</say>');
+    await wait(400);
+    const log = read(t.log), dbgLog = read(dbgFile);
+    check('empty span: dropped as empty-after-clean, never reaching the breaker gate',
+      /speak DROPPED \(empty after clean\)/.test(dbgLog), dbgLog);
+    const postTripSynths = lines(log, 'SYNTH').filter((l) => !l.includes('Boom'));
+    check('empty span: only the real span reaches the endpoint, the empty one never does',
+      postTripSynths.length === 1 && postTripSynths[0].includes('Real probe span.'), log);
+    check('empty span: the real span is what recovers the breaker',
+      /circuit-breaker: endpoint recovered/.test(dbgLog), dbgLog);
+  } finally {
+    __test.now = realNow;
+  }
+  fs.rmSync(dbgFile, { force: true });
+  t.cleanup();
+}
+
+{
+  // Backstop: a probe that never reaches spanSucceeded/spanFailed/releaseProbe (simulated
+  // here as a synth call that simply never returns) must not wedge the breaker "probe in
+  // flight" forever. Once PROBE_DEADLINE_MS has passed -- by the virtual clock, no real
+  // waiting -- the next span declares it lost and takes over as the new probe.
+  const dbgFile = path.join(os.tmpdir(), `pi-simplesay-dbg-${process.pid}-retry-probe-expiry.log`);
+  const hangLog = path.join(os.tmpdir(), `pi-simplesay-hangpid-${process.pid}.log`);
+  let vt = 90_000_000;
+  const realNow = __test.now;
+  __test.now = () => vt;
+  const t = setup({ env: { SIMPLESAY_RETRY_MS: '5000', SIMPLESAY_FAIL_LIMIT: '3', SIMPLESAY_DEBUG: dbgFile }, script: `#!/usr/bin/env bash
+log="$SIMPLESAY_LOG"
+if [ "$1" = "--play" ]; then echo "PLAY|$2" >> "$log"; exit 0; fi
+[ "$1" = "--agent" ] && shift 2
+text="$*"
+echo "SYNTH-START|$text" >> "$log"
+case "$text" in
+  Boom*) : ;;
+  Hang*) echo $$ > "${hangLog}"; exec sleep 300 ;;
+  *) printf 'wav' > "$SAY_OUT" ;;
+esac
+echo "SYNTH-END|$text" >> "$log"
+` });
+  let hangPid = 0;
+  try {
+    await t.commands.simplesay.handler('mode tag', t.ctx);
+    await tagReply(t, '<say>Boom one.</say><say>Boom two.</say><say>Boom three.</say>');
+    await wait(400);
+    vt += 5001; // past the 5s cooldown
+    await tagReply(t, '<say>Hang probe never settles.</say>');
+    await waitFor(() => fs.existsSync(hangLog), 1500);
+    hangPid = Number(read(hangLog).trim());
+    await wait(100);
+    // Still well within the deadline: a second span must be refused, not granted.
+    await tagReply(t, '<say>Too soon, still probing.</say>');
+    await wait(100);
+    check('probe expiry: a span before the deadline is refused as "probe in flight"',
+      /speak DROPPED \(probe in flight\)/.test(read(dbgFile)), read(dbgFile));
+    // Jump the virtual clock past PROBE_DEADLINE_MS -- no real waiting.
+    vt += 10 * 60_000; // 10 minutes, comfortably past any default PROBE_DEADLINE_MS
+    await tagReply(t, '<say>New probe after the deadline.</say>');
+    await wait(150);
+    const dbgLog = read(dbgFile);
+    check('probe expiry: the stuck probe is declared lost after the deadline',
+      /never settled within \d+ms — treating it as lost, granting a new probe/.test(dbgLog), dbgLog);
+    check('probe expiry: a new probe is granted to the next span',
+      /circuit-breaker: cooldown elapsed \(\d+ms\) — probing with this span \(#2\)/.test(dbgLog), dbgLog);
+    check('probe expiry: the new span is actually dispatched (passed the gate)',
+      /speak: "New probe after the deadline\./.test(dbgLog), dbgLog);
+  } finally {
+    __test.now = realNow;
+    if (hangPid) { try { process.kill(hangPid, 'SIGKILL'); } catch {} }
+  }
+  fs.rmSync(dbgFile, { force: true });
+  fs.rmSync(hangLog, { force: true });
+  t.cleanup();
+}
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
 
